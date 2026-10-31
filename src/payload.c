@@ -72,6 +72,11 @@ static void finalize_uncompression(void *dest, size_t dest_len)
     if (next > end) {
         // Explicitly *un*aligned or it'll fail this assert, since 64b alignment is the default
         assert(end == heapblock_alloc_aligned((u8 *)next - (u8 *)end, 1));
+        /* The ARM64 header includes the runtime/BSS footprint, while a
+         * compressed input contains only file bytes. Clear the additional,
+         * now-reserved span instead of passing previous firmware data on.
+         */
+        memset(end, 0, (u8 *)next - (u8 *)end);
     }
 }
 
