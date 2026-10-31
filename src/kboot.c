@@ -1461,6 +1461,8 @@ static int dt_append_acio_tunable(int adt_node, int fdt_node,
     return 0;
 }
 
+#include "kboot_j704_platform.h"
+
 static u8 crc8(u8 *b, size_t len)
 {
     u8 value = 0xff;
@@ -1836,6 +1838,17 @@ static int dt_get_iommu_node(int node, u32 num)
     return fdt_node_offset_by_phandle(dt, phandle);
 }
 
+/* Runtime reservations may be the first consumer of an otherwise unreferenced
+ * static node. Do not depend on a DTB compiled with overlay symbols (-@). */
+static u32 dt_ensure_phandle(int node)
+{
+    u32 phandle = fdt_get_phandle(dt, node);
+    if (!phandle && (fdt_generate_phandle(dt, &phandle) ||
+                    fdt_setprop_u32(dt, node, "phandle", phandle)))
+        return 0;
+    return phandle;
+}
+
 static dart_dev_t *dt_init_dart_by_node(int node, u32 num)
 {
     int len;
@@ -1852,6 +1865,43 @@ static dart_dev_t *dt_init_dart_by_node(int node, u32 num)
 
     printf("FDT: iommu phande:%u stream:%u\n", iommu_phandle, iommu_stream);
 
+    if (chip_id == T8142) {
+        u64 dram, size;
+        int chosen = adt_path_offset(adt, "/chosen");
+        u32 length = 0;
+        const void *p = chosen < 0 ? NULL : adt_getprop(adt, chosen, "dram-base", &length);
+        if (!p || length != sizeof(dram)) return NULL;
+        memcpy(&dram, p, sizeof(dram));
+        p = adt_getprop(adt, chosen, "dram-size", &length);
+        if (!p || length != sizeof(size)) return NULL;
+        memcpy(&size, p, sizeof(size));
+        dart_dev_t *dart = dart_init_fdt_inherited(dt, iommu_phandle, iommu_stream, dram, size);
+        if (!dart)
+            return NULL;
+        u64 *pages = calloc(2049, sizeof(*pages));
+        size_t count = 0;
+        int ret = pages ? dart_collect_locked_tables(dart, dram, size, pages, 2049, &count) : -1;
+        for (size_t i = 0; !ret && i < count; i++) {
+            bool reserved = false;
+            for (int j = 0; j < fdt_num_mem_rsv(dt); j++) {
+                u64 base, span;
+                if (fdt_get_mem_rsv(dt, j, &base, &span)) {
+                    ret = -1;
+                    break;
+                }
+                if (pages[i] >= base && span >= SZ_16K && pages[i] - base <= span - SZ_16K)
+                    reserved = true;
+            }
+            if (!ret && !reserved)
+                ret = fdt_add_mem_rsv(dt, pages[i], SZ_16K);
+        }
+        free(pages);
+        if (ret) {
+            dart_shutdown(dart);
+            return NULL;
+        }
+        return dart;
+    }
     if (chip_id == T8140)
         return dart_init_fdt_locked(dt, iommu_phandle, iommu_stream);
     return dart_init_fdt(dt, iommu_phandle, iommu_stream, true);
@@ -1887,12 +1937,68 @@ static int dt_device_set_reserved_mem(int node, const char *name, uint32_t phand
     return 0;
 }
 
+static int dt_device_add_mem_region(const char *alias, uint32_t phandle, const char *name);
+
+struct t8142_display_reservation {
+    const char *device;
+    u32 phandle;
+    u64 bus_base, bus_size;
+};
+
+/* Physical memory is already reserved by the carveout node. These separate
+ * IOVA-only reservations keep fragmented aliases out of the IOVA allocator
+ * without falsely describing them as direct mappings of the entire carveout. */
+static int dt_t8142_reserve_iova(u64 iova, u64 size, void *opaque)
+{
+    struct t8142_display_reservation *reservation = opaque;
+    if (iova >= reservation->bus_size || size > reservation->bus_size - iova)
+        return -1;
+    iova += reservation->bus_base;
+    char name[80];
+    snprintf(name, sizeof(name), "display-iova-%x-%lx", reservation->phandle, iova);
+    int parent = fdt_path_offset(dt, "/reserved-memory");
+    int node = parent < 0 ? parent : fdt_subnode_offset(dt, parent, name);
+    if (node == -FDT_ERR_NOTFOUND)
+        node = fdt_add_subnode(dt, parent, name);
+    if (node < 0)
+        return -1;
+    u32 phandle = dt_ensure_phandle(node);
+    node = fdt_node_offset_by_phandle(dt, phandle);
+    if (!phandle || node < 0 || fdt_setprop_string(dt, node, "compatible", "apple,asc-mem"))
+        return -1;
+    /* Replace on retry; do not duplicate an earlier alias record. */
+    fdt_delprop(dt, node, "iommu-addresses");
+    if (dt_device_set_reserved_mem(node, name, reservation->phandle, iova, size))
+        return -1;
+    return dt_device_add_mem_region(reservation->device, phandle, name);
+}
+
+static int dt_t8142_reserve_fragmented(dart_dev_t *dart, const char *device,
+                                       u32 phandle, u64 paddr, u64 size)
+{
+    int owner = fdt_node_offset_by_phandle(dt, phandle);
+    int iommu = owner < 0 ? owner : dt_get_iommu_node(owner, 0);
+    int length = 0;
+    const fdt64_t *range = iommu < 0 ? NULL : fdt_getprop(dt, iommu, "apple,dma-range", &length);
+    if (!range || length != 16)
+        return -1;
+    struct t8142_display_reservation reservation = {
+        .device = device, .phandle = phandle,
+        .bus_base = fdt64_ld(&range[0]), .bus_size = fdt64_ld(&range[1]),
+    };
+    if (!reservation.bus_size || reservation.bus_base > UINT64_MAX - reservation.bus_size)
+        return -1;
+    return dart_walk_inherited_range(dart, paddr, size, dt_t8142_reserve_iova, &reservation);
+}
+
 static int dt_device_set_reserved_mem_from_dart(int node, dart_dev_t *dart, const char *device,
                                                 const char *name, uint32_t phandle, u64 paddr,
                                                 u64 size)
 {
     u64 iova = dart_get_mapping(dart, name, paddr, size);
     if (DART_IS_ERR(iova)) {
+        if (chip_id == T8142)
+            return dt_t8142_reserve_fragmented(dart, device, phandle, paddr, size);
         printf("FDT: %s DART %s: no contiguous mapping for PA 0x%lx size 0x%lx\n", device, name,
                paddr, size);
         if (chip_id == T8140) {
@@ -2200,40 +2306,46 @@ static int dt_add_reserved_regions(const char *dcp_alias, const char *disp_alias
         int dcp_node = fdt_path_offset(dt, dcp_alias);
         if (dcp_node < 0) {
             printf("FDT: could not resolve '%s' alias\n", dcp_alias);
-            ret = chip_id == T8140 ? -1 : 0;
+            ret = (chip_id == T8140 || chip_id == T8142) ? -1 : 0;
             goto err; // cleanup
         }
         dart_dcp = dt_init_dart_by_node(dcp_node, 0);
         if (!dart_dcp)
             bail_cleanup("FDT: failed to init DART for '%s'\n", dcp_alias);
-        dcp_phandle = fdt_get_phandle(dt, dcp_node);
+        dcp_phandle = dt_ensure_phandle(dcp_node);
+        if (!dcp_phandle)
+            bail_cleanup("FDT: could not allocate display owner phandle\n");
     }
 
     if (disp_alias) {
         int disp_node = fdt_path_offset(dt, disp_alias);
         if (disp_node < 0) {
             printf("FDT: could not resolve '%s' alias\n", disp_alias);
-            ret = chip_id == T8140 ? -1 : 0;
+            ret = (chip_id == T8140 || chip_id == T8142) ? -1 : 0;
             goto err; // cleanup
         }
         dart_disp = dt_init_dart_by_node(disp_node, 0);
         if (!dart_disp)
             bail_cleanup("FDT: failed to init DART for '%s'\n", disp_alias);
-        disp_phandle = fdt_get_phandle(dt, disp_node);
+        disp_phandle = dt_ensure_phandle(disp_node);
+        if (!disp_phandle)
+            bail_cleanup("FDT: could not allocate display owner phandle\n");
     }
 
     if (piodma_alias) {
         int piodma_node = fdt_path_offset(dt, piodma_alias);
         if (piodma_node < 0) {
             printf("FDT: could not resolve '%s' alias\n", piodma_alias);
-            ret = chip_id == T8140 ? -1 : 0;
+            ret = (chip_id == T8140 || chip_id == T8142) ? -1 : 0;
             goto err; // cleanup
         }
 
         dart_piodma = dt_init_dart_by_node(piodma_node, 0);
         if (!dart_piodma)
             bail_cleanup("FDT: failed to init DART for '%s'\n", piodma_alias);
-        piodma_phandle = fdt_get_phandle(dt, piodma_node);
+        piodma_phandle = dt_ensure_phandle(piodma_node);
+        if (!piodma_phandle)
+            bail_cleanup("FDT: could not allocate display owner phandle\n");
     }
 
     for (unsigned i = 0; i < num_maps; i++) {
@@ -2252,20 +2364,20 @@ static int dt_add_reserved_regions(const char *dcp_alias, const char *disp_alias
 
         if (maps[i].map_dcp && dart_dcp) {
             ret =
-                dt_device_set_reserved_mem_from_dart(mem_node, dart_dcp, dcp_alias, node_name,
+                dt_device_set_reserved_mem_from_dart(fdt_node_offset_by_phandle(dt, mem_phandle), dart_dcp, dcp_alias, node_name,
                                                      dcp_phandle, region[i].paddr, region[i].size);
             if (ret != 0)
                 goto err;
         }
         if (maps[i].map_disp && dart_disp) {
             ret =
-                dt_device_set_reserved_mem_from_dart(mem_node, dart_disp, disp_alias, node_name,
+                dt_device_set_reserved_mem_from_dart(fdt_node_offset_by_phandle(dt, mem_phandle), dart_disp, disp_alias, node_name,
                                                      disp_phandle, region[i].paddr, region[i].size);
             if (ret != 0)
                 goto err;
         }
         if (maps[i].map_piodma && dart_piodma) {
-            ret = dt_device_set_reserved_mem_from_dart(mem_node, dart_piodma, piodma_alias,
+            ret = dt_device_set_reserved_mem_from_dart(fdt_node_offset_by_phandle(dt, mem_phandle), dart_piodma, piodma_alias,
                                                        node_name, piodma_phandle, region[i].paddr,
                                                        region[i].size);
             if (ret != 0)
@@ -4415,6 +4527,14 @@ static struct disp_mapping disp_reserved_regions_t8142[] = {
     {"region-id-95", "region95", true, false, true},
 };
 
+/* DCPEXT1 has its own data and shared carveouts. Its firmware TEXT is a
+ * subset of the global ASC carveout, so reserve it from the live segment list
+ * instead of claiming that DCPEXT maps the complete internal-DCP region. */
+static struct disp_mapping dcpext_reserved_regions_t8142[] = {
+    {"region-id-88", "dcpext1_data", true, false, false},
+    {"region-id-89", "region89", true, false, false},
+};
+
 static bool dt_display_phys_reserved(u64 phys, u64 size)
 {
     int parent = fdt_path_offset(dt, "/reserved-memory");
@@ -4439,11 +4559,10 @@ static bool dt_display_phys_reserved(u64 phys, u64 size)
  * IOVA-only reservations avoid overlapping physical reserved-memory nodes
  * when a segment is already contained in a carveout or the framebuffer.
  */
-static int dt_reserve_m5_display_segments(void)
+static int dt_reserve_m5_display_segments_for(const char *alias, const char *nub_path)
 {
-    const char *alias = "dcp";
     int owner = fdt_path_offset(dt, alias);
-    int nub = adt_path_offset(adt, "/arm-io/dcp/iop-dcp-nub");
+    int nub = adt_path_offset(adt, nub_path);
     int chosen = adt_path_offset(adt, "/chosen");
     u64 dram, dram_size;
     u32 len = 0;
@@ -4453,12 +4572,16 @@ static int dt_reserve_m5_display_segments(void)
     if (owner < 0)
         return 0;
     if (nub < 0 || chosen < 0 || ADT_GETPROP(adt, chosen, "dram-base", &dram) != sizeof(dram) ||
-        ADT_GETPROP(adt, chosen, "dram-size", &dram_size) != sizeof(dram_size))
+        ADT_GETPROP(adt, chosen, "dram-size", &dram_size) != sizeof(dram_size) ||
+        dram_size < SZ_16K || dram > UINT64_MAX - dram_size)
         bail("ADT: missing M5 display firmware memory bounds\n");
     segments = adt_getprop(adt, nub, "segment-ranges", &len);
     if (!segments || !len || len % sizeof(*segments) || len / sizeof(*segments) > 64)
         bail("ADT: invalid M5 display segment inventory\n");
-    u32 owner_phandle = fdt_get_phandle(dt, owner);
+    u32 owner_phandle = dt_ensure_phandle(owner);
+    if (!owner_phandle)
+        bail("FDT: cannot allocate M5 display owner phandle\n");
+    owner = fdt_node_offset_by_phandle(dt, owner_phandle);
     dart_dev_t *dart = dt_init_dart_by_node(owner, 0);
     if (!dart)
         bail("FDT: cannot inspect M5 display firmware translations\n");
@@ -5162,6 +5285,15 @@ static int dt_set_display(void)
                                            ARRAY_SIZE(disp_reserved_regions_t8142));
         if (ret)
             return ret;
+        if (fdt_get_alias(dt, "dcpext1")) {
+            ret = dt_carveout_reserved_regions("dcpext1", "/ext-display-subsystem", NULL,
+                                               dcpext_reserved_regions_t8142,
+                                               ARRAY_SIZE(dcpext_reserved_regions_t8142));
+            if (ret || dt_reserve_m5_display_segments_for("dcpext1",
+                         "/arm-io/dcpext1/iop-dcpext1-nub")) return -1;
+            int display = fdt_path_offset(dt, "/ext-display-subsystem");
+            if (display < 0 || fdt_setprop_string(dt, display, "status", "okay")) return -1;
+        }
     } else {
         printf("FDT: unknown compatible, skip display reserved-memory setup\n");
         return 0;
@@ -5184,8 +5316,11 @@ static int dt_set_display(void)
     ret = dt_vram_reserved_region(disp_cfg ? disp_cfg->dcp_alias : "dcp", "disp0");
     if (ret)
         return ret;
-    if (!fdt_node_check_compatible(dt, 0, "apple,t8142"))
-        return dt_reserve_m5_display_segments();
+    if (!fdt_node_check_compatible(dt, 0, "apple,t8142")) {
+        if (dt_reserve_m5_display_segments_for("dcp", "/arm-io/dcp/iop-dcp-nub")) return -1;
+        int display = fdt_path_offset(dt, "disp0");
+        if (display >= 0 && fdt_setprop_string(dt, display, "status", "okay")) return -1;
+    }
     return 0;
 }
 
@@ -5268,6 +5403,36 @@ static int dt_set_pmp(void)
     if (pmp_node < 0) {
         printf("FDT: pmp not found in devtree\n");
         return 0;
+    }
+    if (chip_id == T8142 && !fdt_node_check_compatible(dt, 0, "apple,j704")) {
+        int nub = adt_path_offset(adt, "/arm-io/pmp/iop-pmp-nub");
+        u32 loaded, length = 0;
+        int reg_length = 0;
+        const fdt32_t *reg = fdt_getprop(dt, pmp_node, "reg", &reg_length);
+        if (nub < 0 || !reg || reg_length < (int)(4 * sizeof(*reg)) ||
+            ADT_GETPROP(adt, nub, "pre-loaded", &loaded) != sizeof(loaded) || loaded != 1)
+            return -1;
+        u64 base = ((u64)fdt32_to_cpu(reg[0]) << 32) | fdt32_to_cpu(reg[1]);
+        u64 size = ((u64)fdt32_to_cpu(reg[2]) << 32) | fdt32_to_cpu(reg[3]);
+        const struct adt_segment_ranges *segments = adt_getprop(adt, nub, "segment-ranges", &length);
+        if (!size || base > UINT64_MAX - size || !segments || !length ||
+            length % sizeof(*segments) || length / sizeof(*segments) > 64)
+            return -1;
+        /* PMP firmware is resident in the device's SRAM, including unaligned
+         * subsegments. It is not a DRAM carveout or a DART reservation. */
+        for (u32 i = 0; i < length / sizeof(*segments); i++) {
+            if (!segments[i].size || segments[i].phys < base ||
+                segments[i].phys - base > size ||
+                segments[i].size > size - (segments[i].phys - base) ||
+                segments[i].remap != segments[i].phys)
+                return -1;
+        }
+        if (dt_fill_pmp(pmp_node))
+            return -1;
+        /* The report owns power/SRAM checks, seeding and ordered activation of
+         * the DART, mailbox and PMP. Preserve their disabled startup state. */
+        int report = fdt_path_offset(dt, "/soc/pmp-report@3803c0000");
+        return report < 0 ? -1 : fdt_setprop_string(dt, report, "status", "okay");
     }
     int chosen_anode = adt_path_offset(adt, "/chosen");
     if (chosen_anode < 0)
@@ -6425,6 +6590,8 @@ int kboot_prepare_dt(void *fdt)
     if (dt_set_acio_tunables())
         return -1;
     if (dt_set_pcie_tunables())
+        return -1;
+    if (dt_set_j704_platform_data())
         return -1;
     if (dt_set_ave())
         return -1;

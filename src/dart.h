@@ -22,6 +22,7 @@ dart_dev_t *dart_init_adt(const char *path, int instance, int device, bool keep_
 dart_dev_t *dart_init_adt_display(const char *path, int instance, int device);
 void dart_lock_adt(const char *path, int instance);
 dart_dev_t *dart_init_fdt(void *dt, u32 phandle, int device, bool keep_pts);
+dart_dev_t *dart_init_fdt_inherited(void *dt, u32 phandle, int device, u64 dram_base, u64 dram_size);
 dart_dev_t *dart_init_fdt_locked(void *dt, u32 phandle, int device);
 int dart_collect_locked_tables(dart_dev_t *dart, u64 dram_base, u64 dram_size, u64 *pages,
                                size_t capacity, size_t *count);
@@ -35,6 +36,8 @@ void *dart_translate_silent(dart_dev_t *dart, uintptr_t iova);
 int dart_walk_locked_t8110(uintptr_t base, u8 sid, u64 dram_base, u64 dram_size,
                            int (*visit)(u64 iova, u64 paddr, void *opaque), void *opaque);
 u64 dart_search(dart_dev_t *dart, void *paddr);
+int dart_walk_inherited_range(dart_dev_t *dart, u64 paddr, u64 size,
+                               int (*visit)(u64 iova, u64 size, void *opaque), void *opaque);
 u64 dart_find_iova(dart_dev_t *dart, s64 start, size_t len);
 u64 dart_search_range(dart_dev_t *dart, u64 paddr, size_t len);
 void dart_shutdown(dart_dev_t *dart);

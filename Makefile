@@ -227,6 +227,7 @@ OBJECTS := \
 
 FP_OBJECTS := \
 	kboot_gpu.o \
+	kboot_gpu_t8142.o \
 	math/expf.o \
 	math/exp2f_data.o \
 	math/powf.o \

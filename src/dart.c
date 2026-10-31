@@ -114,6 +114,8 @@ struct dart_params {
 };
 
 struct dart_dev {
+    bool read_only;
+    u64 dram_base, dram_size;
     bool locked;
     bool keep;
     bool legacy_mutable;
@@ -562,6 +564,78 @@ dart_dev_t *dart_init_fdt(void *dt, u32 phandle, int device, bool keep_pts)
     return dart;
 }
 
+/* Inspectors may dereference only complete translation-table pages in DRAM. */
+static bool dart_view_table_valid(dart_dev_t *dart, u64 pa)
+{
+    return !dart->read_only ||
+           (!(pa & (SZ_16K - 1)) && pa >= dart->dram_base &&
+            dart->dram_size >= SZ_16K &&
+            pa - dart->dram_base <= dart->dram_size - SZ_16K);
+}
+
+static bool dart_inherited_tcr_valid(u32 tcr)
+{
+    const u32 allowed = DART_T8110_TCR_TRANSLATE_ENABLE | DART_T8110_TCR_BYPASS_DAPF |
+                        DART_T8110_TCR_REMAP;
+    return (tcr & DART_T8110_TCR_TRANSLATE_ENABLE) && !(tcr & ~allowed);
+}
+
+/* Borrow an existing T8110 stream without enabling streams, allocating roots,
+ * invalidating translations or changing lock state. The caller owns neither
+ * tables nor hardware and provides this boot's complete DRAM bounds. */
+dart_dev_t *dart_init_fdt_inherited(void *dt, u32 phandle, int device,
+                                    u64 dram_base, u64 dram_size)
+{
+    int node = fdt_node_offset_by_phandle(dt, phandle);
+    if (node < 0 || device < 0 || device >= dart_t8110.sid_count ||
+        fdt_node_check_compatible(dt, node, "apple,t8110-dart") ||
+        dram_size < SZ_16K || dram_base > UINT64_MAX - dram_size)
+        return NULL;
+    u64 base = dt_get_address(dt, node);
+    if (!base)
+        return NULL;
+    dart_dev_t *dart = calloc(1, sizeof(*dart));
+    if (!dart)
+        return NULL;
+    dart->read_only = true;
+    dart->dram_base = dram_base;
+    dart->dram_size = dram_size;
+    dart->keep = true;
+    dart->regs = base;
+    dart->device = device;
+    dart->type = DART_T8110;
+    dart->params = &dart_t8110;
+    dart->locked = !!(read32(base + DART_T8110_PROTECT) & DART_T8110_PROTECT_TTBR_TCR);
+    u32 tcr = read32(DART_TCR(dart));
+    if (!dart_inherited_tcr_valid(tcr))
+        goto refuse;
+    bool mapped = false;
+    for (int i = 0; i < dart->params->ttbr_count; i++) {
+        u32 ttbr = read32(DART_TTBR(dart, i));
+        if (!(ttbr & dart->params->ttbr_valid))
+            continue;
+        u64 pa = (u64)FIELD_GET(dart->params->ttbr_addr, ttbr) << dart->params->ttbr_shift;
+        if (!dart_view_table_valid(dart, pa))
+            goto refuse;
+        dart->l1[i] = (u64 *)pa;
+        for (unsigned int j = 0; j < SZ_16K / sizeof(u64); j++) {
+            u64 pte = dart->l1[i][j];
+            if (!(pte & DART_PTE_VALID))
+                continue;
+            u64 l2 = FIELD_GET(dart->params->offset_mask, pte) << DART_PTE_OFFSET_SHIFT;
+            if (!dart_view_table_valid(dart, l2))
+                goto refuse;
+        }
+        mapped = true;
+    }
+    if (!mapped)
+        goto refuse;
+    return dart;
+refuse:
+    free(dart);
+    return NULL;
+}
+
 /* Inspect an inherited display translation without creating a root or
  * enabling a stream if firmware did not leave the DART locked. */
 dart_dev_t *dart_init_fdt_locked(void *dt, u32 phandle, int device)
@@ -600,7 +674,10 @@ int dart_collect_locked_tables(dart_dev_t *dart, u64 dram_base, u64 dram_size, u
         return -1;
     u32 tcr = read32(DART_TCR(dart));
     u32 ttbr = read32(DART_TTBR(dart, 0));
-    if (tcr != DART_T8110_TCR_TRANSLATE_ENABLE || !(ttbr & DART_T8110_TTBR_VALID) ||
+    bool translating = dart->read_only ?
+        dart_inherited_tcr_valid(tcr) :
+        tcr == DART_T8110_TCR_TRANSLATE_ENABLE;
+    if (!translating || !(ttbr & DART_T8110_TTBR_VALID) ||
         (FIELD_GET(DART_T8110_TTBR_ADDR, ttbr) << DART_T8110_TTBR_SHIFT) != (u64)dart->l1[0])
         return -1;
 
@@ -635,6 +712,7 @@ int dart_collect_locked_tables(dart_dev_t *dart, u64 dram_base, u64 dram_size, u
 
 int dart_setup_pt_region(dart_dev_t *dart, const char *path, int device, u64 vm_base)
 {
+    if (dart->read_only) return -1;
     if (dart->locked)
         return -1;
 
@@ -781,7 +859,7 @@ static int dart_map_page(dart_dev_t *dart, uintptr_t iova, uintptr_t paddr, u32 
 
 int dart_map_flags(dart_dev_t *dart, uintptr_t iova, void *bfr, size_t len, u32 flags)
 {
-    if (dart->locked && !dart->legacy_mutable)
+    if (dart->read_only || (dart->locked && !dart->legacy_mutable))
         return -1;
 
     uintptr_t paddr = (uintptr_t)bfr;
@@ -833,7 +911,7 @@ static void dart_unmap_page(dart_dev_t *dart, uintptr_t iova)
 
 void dart_unmap(dart_dev_t *dart, uintptr_t iova, size_t len)
 {
-    if (dart->locked && !dart->legacy_mutable)
+    if (dart->read_only || (dart->locked && !dart->legacy_mutable))
         return;
 
     if (len % SZ_16K)
@@ -853,7 +931,7 @@ void dart_unmap(dart_dev_t *dart, uintptr_t iova, size_t len)
 
 void dart_free_l2(dart_dev_t *dart, uintptr_t iova)
 {
-    if (dart->locked)
+    if (dart->read_only || dart->locked)
         return;
 
     if (iova & ((1 << 25) - 1)) {
@@ -904,6 +982,9 @@ static void *dart_translate_internal(dart_dev_t *dart, uintptr_t iova, int silen
     u32 l2_index = (iova >> 14) & 0x7ff;
     u64 *l2 = (u64 *)(FIELD_GET(dart->params->offset_mask, dart->l1[ttbr][l1_index])
                       << DART_PTE_OFFSET_SHIFT);
+
+    if (!dart_view_table_valid(dart, (u64)l2))
+        return NULL;
 
     if (!(l2[l2_index] & DART_PTE_VALID)) {
         if (!silent)
@@ -993,6 +1074,8 @@ u64 dart_search(dart_dev_t *dart, void *paddr)
 
             u64 *l2 = (u64 *)(FIELD_GET(dart->params->offset_mask, dart->l1[ttbr][l1_index])
                               << DART_PTE_OFFSET_SHIFT);
+            if (!dart_view_table_valid(dart, (u64)l2))
+                return DART_PTR_ERR;
             for (u32 l2_index = 0; l2_index < 0x7ff; l2_index++) {
                 if (!(l2[l2_index] & DART_PTE_VALID))
                     continue;
@@ -1025,6 +1108,8 @@ u64 dart_search_range(dart_dev_t *dart, u64 paddr, size_t len)
                 continue;
             u64 *l2 = (u64 *)(FIELD_GET(dart->params->offset_mask, dart->l1[ttbr][l1])
                               << DART_PTE_OFFSET_SHIFT);
+            if (!dart_view_table_valid(dart, (u64)l2))
+                return DART_PTR_ERR;
             for (u32 page = 0; page < 2048; page++) {
                 if (!(l2[page] & DART_PTE_VALID))
                     continue;
@@ -1049,6 +1134,51 @@ u64 dart_search_range(dart_dev_t *dart, u64 paddr, size_t len)
         }
     }
     return DART_PTR_ERR;
+}
+
+/* Enumerate every inherited alias of a physical carveout. A single carveout
+ * need not be contiguous in DVA space. Coalesce only adjacent PA/DVA pairs. */
+int dart_walk_inherited_range(dart_dev_t *dart, u64 paddr, u64 size,
+                               int (*visit)(u64 iova, u64 size, void *opaque), void *opaque)
+{
+    if (!dart || !dart->read_only || !dart->locked || !visit || !size ||
+        (paddr & (SZ_16K - 1)) || (size & (SZ_16K - 1)) || paddr > UINT64_MAX - size)
+        return -1;
+    u64 run_iova = 0, run_pa = 0, run_size = 0;
+    for (int root = 0; root < dart->params->ttbr_count; root++) {
+        if (!dart->l1[root])
+            continue;
+        for (u32 index = 0; index < 2048; index++) {
+            u64 entry = dart->l1[root][index];
+            if (!(entry & DART_PTE_VALID))
+                continue;
+            u64 pa = FIELD_GET(dart->params->offset_mask, entry) << DART_PTE_OFFSET_SHIFT;
+            if (!dart_view_table_valid(dart, pa))
+                return -1;
+            const u64 *l2 = (const u64 *)pa;
+            for (u32 page = 0; page < 2048; page++) {
+                entry = l2[page];
+                if (!(entry & DART_PTE_VALID))
+                    continue;
+                pa = FIELD_GET(dart->params->offset_mask, entry) << DART_PTE_OFFSET_SHIFT;
+                if (pa < paddr || pa - paddr >= size)
+                    continue;
+                u64 iova = ((u64)root << 36) | ((u64)index << 25) | ((u64)page << 14);
+                if (run_size && (run_iova + run_size != iova || run_pa + run_size != pa)) {
+                    int ret = visit(run_iova, run_size, opaque);
+                    if (ret)
+                        return ret;
+                    run_size = 0;
+                }
+                if (!run_size) {
+                    run_iova = iova;
+                    run_pa = pa;
+                }
+                run_size += SZ_16K;
+            }
+        }
+    }
+    return run_size ? visit(run_iova, run_size, opaque) : 0;
 }
 
 u64 dart_find_iova(dart_dev_t *dart, s64 start, size_t len)
