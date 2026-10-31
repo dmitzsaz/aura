@@ -307,6 +307,13 @@ void m1n1_main(void)
 #endif
 #endif
 
+#ifdef J704_NATIVE_DIAG
+    if (chip_id == T8142 && board_id == 0x22) {
+        fb_set_active(true);
+        printf("J704 native entry: Aura initialized, checking bounded payload\n");
+    }
+#endif
+
     cpufreq_fixup();
 #endif
 

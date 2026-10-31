@@ -11,6 +11,10 @@
 #include "utils.h"
 #include "vsprintf.h"
 #include "xnuboot.h"
+#ifdef J704_NATIVE_DIAG
+#include "fb.h"
+#include "wdt.h"
+#endif
 
 bool is_mac;
 
@@ -128,6 +132,19 @@ bool timeout_expired(u64 timeout)
 
 void flush_and_reboot(void)
 {
+#ifdef J704_NATIVE_DIAG
+    if (chip_id == T8142 && board_id == 0x22) {
+        /* Preserve a native-entry failure for the panel/UART instead of
+         * immediately erasing its evidence by starting another boot loop.
+         */
+        wdt_disable();
+        fb_set_active(true);
+        printf("J704 native boot failure: halted. Hold Power for Startup Options.\n");
+        iodev_console_flush();
+        while (1)
+            sysop("nop");
+    }
+#endif
     iodev_console_flush();
     reboot();
 }
