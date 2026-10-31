@@ -1984,6 +1984,49 @@ static int dt_get_or_add_reserved_mem(const char *node_name, const char *compat,
     return node;
 }
 
+/* A disk-installed J704 payload must not contain a previous boot's MTP
+ * OSLog address. Reserve the current DRAM segments from this boot's ADT.
+ */
+static int dt_reserve_j704_mtp_firmware(void)
+{
+    if (chip_id != T8142 || fdt_node_check_compatible(dt, 0, "apple,j704"))
+        return 0;
+    const char *path = fdt_get_alias(dt, "mtp");
+    if (!path)
+        return 0;
+    int helper = fdt_path_offset(dt, path);
+    if (helper < 0 || fdt_node_check_compatible(dt, helper, "apple,t8142-mtp"))
+        bail("FDT: invalid J704 MTP helper\n");
+    int nub = adt_path_offset(adt, "/arm-io/mtp/iop-mtp-nub");
+    u32 len = 0;
+    const struct adt_segment_ranges *segments =
+        nub < 0 ? NULL : adt_getprop(adt, nub, "segment-ranges", &len);
+    if (!segments || !len || len % sizeof(*segments) || len / sizeof(*segments) > 16 ||
+        cur_boot_args.phys_base > UINT64_MAX - cur_boot_args.mem_size)
+        bail("ADT: invalid J704 MTP firmware segment inventory\n");
+    u64 ram_end = cur_boot_args.phys_base + cur_boot_args.mem_size;
+    unsigned reserved = 0;
+    for (unsigned i = 0; i < len / sizeof(*segments); i++) {
+        u64 phys = segments[i].phys, size = segments[i].size;
+        if (!size || phys > UINT64_MAX - size - (SZ_16K - 1))
+            bail("ADT: invalid J704 MTP firmware extent\n");
+        if (phys < 0x10000000000ULL)
+            continue; /* MTP SRAM is outside the DRAM allocator. */
+        u64 start = ALIGN_DOWN(phys, SZ_16K), end = ALIGN_UP(phys + size, SZ_16K);
+        if (start < cur_boot_args.phys_base || end > ram_end)
+            bail("ADT: J704 MTP firmware lies outside usable RAM\n");
+        char name[64];
+        snprintf(name, sizeof(name), "mtp-firmware-%u@%lx", i, start);
+        if (dt_get_or_add_reserved_mem(name, "apple,asc-mem", true, start, end - start) < 0)
+            return -1;
+        reserved++;
+    }
+    if (!reserved)
+        bail("ADT: no J704 MTP DRAM segment found\n");
+    printf("FDT: reserved %u live J704 MTP firmware DRAM segments\n", reserved);
+    return 0;
+}
+
 static int dt_device_add_mem_region(const char *alias, uint32_t phandle, const char *name)
 {
     int ret;
@@ -5543,6 +5586,87 @@ struct isp_segment_ranges {
     u32 unk;
 } PACKED;
 
+#include "kboot_j704_peripheral_ranges.h"
+
+/* Preserve resident J704 firmware before Linux's allocator can use its DRAM.
+ * Opt-in only: no power, mailbox, DART or firmware memory accesses occur here.
+ * In particular this does not authorize the AP to own an Exclave transport.
+ */
+static int dt_reserve_j704_peripheral_ranges(unsigned int unused)
+{
+    UNUSED(unused);
+    static const struct {
+        const char *path;
+        const char *owner;
+    } roles[] = {
+        {"/arm-io/aop", "aop"},
+        {"/arm-io/aop2", "aop2"},
+    };
+    int chosen_adt = adt_path_offset(adt, "/chosen");
+    u64 dram_base, dram_size;
+    unsigned int reserved = 0;
+    if (chosen_adt < 0 ||
+        ADT_GETPROP(adt, chosen_adt, "dram-base", &dram_base) != sizeof(dram_base) ||
+        ADT_GETPROP(adt, chosen_adt, "dram-size", &dram_size) != sizeof(dram_size))
+        return -1;
+
+    for (size_t r = 0; r < ARRAY_SIZE(roles); r++) {
+        int anode = adt_path_offset(adt, roles[r].path);
+        u32 length = 0;
+        const struct adt_segment_ranges *segments =
+            anode < 0 ? NULL : adt_getprop(adt, anode, "segment-ranges", &length);
+        if (!segments || !length || length % sizeof(*segments) ||
+            length / sizeof(*segments) > 64)
+            return -1;
+        for (unsigned int i = 0; i < length / sizeof(*segments); i++) {
+            u64 span = 0;
+            int in_dram = j704_peripheral_dram_range(segments[i].phys, segments[i].size,
+                                                   dram_base, dram_size, &span);
+            if (in_dram < 0)
+                return -1;
+            if (!in_dram)
+                continue;
+            char name[80];
+            snprintf(name, sizeof(name), "j704-%s-firmware@%lx", roles[r].owner,
+                     segments[i].phys);
+            int node = dt_get_or_add_reserved_mem(name, "apple,asc-mem", true,
+                                                segments[i].phys, span);
+            if (node < 0 || fdt_setprop_string(dt, node, "asahi,firmware-owner", roles[r].owner) ||
+                fdt_setprop_u32(dt, node, "asahi,adt-segment-index", i))
+                return -1;
+            /* No iommu-addresses: raw ADT iova/remap words are not a qualified
+             * Linux mapping contract; __SHARED may have an all-ones iova. */
+            reserved++;
+        }
+    }
+    int chosen = fdt_path_offset(dt, "/chosen");
+    if (chosen < 0 ||
+        fdt_setprop_u32(dt, chosen, "asahi,j704-peripheral-reservations-count", reserved) ||
+        fdt_setprop_u32(dt, chosen, "asahi,j704-peripheral-reservations-ready", 1))
+        return -1;
+    printf("FDT: J704 peripheral firmware: reserved %u current-ADT DRAM segments; no activation\n",
+           reserved);
+    return 0;
+}
+
+static int dt_set_j704_peripheral_reservations(void)
+{
+    int chosen = fdt_path_offset(dt, "/chosen");
+    int length = 0;
+    const fdt32_t *requested = chosen < 0 ? NULL :
+        fdt_getprop(dt, chosen, "asahi,j704-peripheral-reservations", &length);
+    if (!requested)
+        return 0;
+    if (chip_id != T8142 || fdt_node_check_compatible(dt, 0, "apple,j704") ||
+        length != sizeof(*requested) || fdt32_to_cpu(*requested) != 1)
+        return 0;
+    /* Reuse the complete-FDT transaction helper: a failure commits nothing.
+     * Never fail the boot over it; the AOP driver checks for the reservation. */
+    if (dt_display_transaction(dt_reserve_j704_peripheral_ranges, 0))
+        printf("FDT: J704 peripheral firmware reservation failed; AOP left unreserved\n");
+    return 0;
+}
+
 static int dt_set_isp_fwdata(void)
 {
     const char *fdt_path = "isp";
@@ -6286,6 +6410,8 @@ int kboot_prepare_dt(void *fdt)
         return -1;
     if (dt_set_cpus())
         return -1;
+    if (dt_reserve_j704_mtp_firmware())
+        return -1;
     if (dt_set_mac_addresses())
         return -1;
     if (dt_set_wifi())
@@ -6325,6 +6451,8 @@ int kboot_prepare_dt(void *fdt)
     if (dt_disable_missing_j700_touch_id())
         return -1;
     if (dt_setup_sio())
+        return -1;
+    if (dt_set_j704_peripheral_reservations())
         return -1;
     if (dt_set_isp())
         return -1;
