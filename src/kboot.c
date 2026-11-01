@@ -5754,8 +5754,8 @@ struct isp_segment_ranges {
 #include "kboot_j704_peripheral_ranges.h"
 
 /* Preserve resident J704 firmware before Linux's allocator can use its DRAM.
- * Opt-in only: no power, mailbox, DART or firmware memory accesses occur here.
- * In particular this does not authorize the AP to own an Exclave transport.
+ * Read only current ADT metadata: no power, mailbox, DART or firmware memory
+ * accesses occur here. This does not authorize an Exclave transport.
  */
 static int dt_reserve_j704_peripheral_ranges(unsigned int unused)
 {
@@ -5816,19 +5816,15 @@ static int dt_reserve_j704_peripheral_ranges(unsigned int unused)
 
 static int dt_set_j704_peripheral_reservations(void)
 {
-    int chosen = fdt_path_offset(dt, "/chosen");
-    int length = 0;
-    const fdt32_t *requested = chosen < 0 ? NULL :
-        fdt_getprop(dt, chosen, "asahi,j704-peripheral-reservations", &length);
-    if (!requested)
+    if (chip_id != T8142 || fdt_node_check_compatible(dt, 0, "apple,j704"))
         return 0;
-    if (chip_id != T8142 || fdt_node_check_compatible(dt, 0, "apple,j704") ||
-        length != sizeof(*requested) || fdt32_to_cpu(*requested) != 1)
-        return 0;
-    /* Reuse the complete-FDT transaction helper: a failure commits nothing.
-     * Never fail the boot over it; the AOP driver checks for the reservation. */
+
+    /* The firmware is already resident, independently of whether Linux has
+     * an audio driver. Do not make its lifetime depend on a bring-up flag.
+     * A failed transaction must not enter Linux with reusable firmware RAM.
+     */
     if (dt_display_transaction(dt_reserve_j704_peripheral_ranges, 0))
-        printf("FDT: J704 peripheral firmware reservation failed; AOP left unreserved\n");
+        bail("FDT: couldn't reserve resident J704 AOP firmware\n");
     return 0;
 }
 
