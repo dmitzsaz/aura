@@ -5789,9 +5789,12 @@ static int dt_reserve_j704_peripheral_ranges(unsigned int unused)
     static const struct {
         const char *path;
         const char *owner;
+        bool no_map;
     } roles[] = {
-        {"/arm-io/aop", "aop"},
-        {"/arm-io/aop2", "aop2"},
+        {"/arm-io/aop", "aop", true},
+        {"/arm-io/aop2", "aop2", true},
+        /* ANS shared buffers must stay reserved in the CPU linear map. */
+        {"/arm-io/ans/iop-ans-nub", "ans", false},
     };
     int chosen_adt = adt_path_offset(adt, "/chosen");
     u64 dram_base, dram_size;
@@ -5820,7 +5823,7 @@ static int dt_reserve_j704_peripheral_ranges(unsigned int unused)
             char name[80];
             snprintf(name, sizeof(name), "j704-%s-firmware@%lx", roles[r].owner,
                      segments[i].phys);
-            int node = dt_get_or_add_reserved_mem(name, "apple,asc-mem", true,
+            int node = dt_get_or_add_reserved_mem(name, "apple,asc-mem", roles[r].no_map,
                                                 segments[i].phys, span);
             if (node < 0 || fdt_setprop_string(dt, node, "asahi,firmware-owner", roles[r].owner) ||
                 fdt_setprop_u32(dt, node, "asahi,adt-segment-index", i))
@@ -5850,7 +5853,41 @@ static int dt_set_j704_peripheral_reservations(void)
      * A failed transaction must not enter Linux with reusable firmware RAM.
      */
     if (dt_display_transaction(dt_reserve_j704_peripheral_ranges, 0))
-        bail("FDT: couldn't reserve resident J704 AOP firmware\n");
+        bail("FDT: couldn't reserve resident J704 peripheral firmware\n");
+    return 0;
+}
+
+/* ADT supplies the current boot's firmware state; Linux validates the
+ * disabled controller and empty NVMMU before negotiating a fresh session.
+ * Do not access storage MMIO or initiate RTKit here. */
+static int dt_set_j704_ans(void)
+{
+    if (chip_id != T8142 || fdt_node_check_compatible(dt, 0, "apple,j704"))
+        return 0;
+    const char *aliases[] = {"ans-mailbox", "ans-sart", "nvme"};
+    int nub = adt_path_offset(adt, "/arm-io/ans/iop-ans-nub");
+    u32 running = 0, preloaded = 0;
+    bool quiesced = nub >= 0 && adt_get_property(adt, nub, "quiesced");
+    if (nub < 0 || !quiesced ||
+        ADT_GETPROP(adt, nub, "running", &running) != sizeof(running) || !running ||
+        ADT_GETPROP(adt, nub, "pre-loaded", &preloaded) != sizeof(preloaded) || !preloaded) {
+        printf("FDT: J704 ANS is not preloaded and quiesced; leaving storage disabled\n");
+        return 0;
+    }
+    for (size_t i = 0; i < ARRAY_SIZE(aliases); i++) {
+        int node = fdt_path_offset(dt, aliases[i]);
+        if (node < 0)
+            return 0; /* Older tree: retain its existing storage policy. */
+    }
+    int node = fdt_path_offset(dt, "nvme");
+    if (fdt_setprop_string(dt, node, "apple,rtkit-handoff", "nvme-quiesced-v1"))
+        return -1;
+    for (size_t i = 0; i < ARRAY_SIZE(aliases); i++) {
+        node = fdt_path_offset(dt, aliases[i]);
+        if (node < 0 || fdt_setprop_string(dt, node, "status", "okay"))
+            return -1;
+    }
+    printf("FDT: J704 ANS reserved and quiesced; enabling Linux RTKit wake\n");
     return 0;
 }
 
@@ -6642,6 +6679,8 @@ int kboot_prepare_dt(void *fdt)
     if (dt_setup_sio())
         return -1;
     if (dt_set_j704_peripheral_reservations())
+        return -1;
+    if (dt_set_j704_ans())
         return -1;
     if (dt_set_isp())
         return -1;
