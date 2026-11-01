@@ -4553,12 +4553,56 @@ static bool dt_display_phys_reserved(u64 phys, u64 size)
     return false;
 }
 
-/* The T8142 DCP data carveout is fragmented in DVA space, and __SHARED
- * extends outside it. Preserve every live segment, including aliases whose ADT
- * physical field differs from the active DART translation (__OS_LOG).
- * IOVA-only reservations avoid overlapping physical reserved-memory nodes
- * when a segment is already contained in a carveout or the framebuffer.
- */
+/* Reserve physical firmware storage independently of its bus aliases. An ADT
+ * segment, notably DCPEXT's __OS_LOG, can have no mapping in this DART stream.
+ * Its declared storage must still stay out of Linux's allocator. */
+static int dt_m5_reserve_display_phys(u64 phys, u64 size)
+{
+    for (u64 offset = 0; offset < size;) {
+        bool reserved = dt_display_phys_reserved(phys + offset, SZ_16K);
+        u64 count = SZ_16K;
+        while (offset + count < size &&
+               dt_display_phys_reserved(phys + offset + count, SZ_16K) == reserved)
+            count += SZ_16K;
+        if (!reserved) {
+            char name[64];
+            snprintf(name, sizeof(name), "dcp-firmware@%lx", (unsigned long)(phys + offset));
+            if (dt_get_or_add_reserved_mem(name, "apple,asc-mem", true,
+                                           phys + offset, count) < 0)
+                return -1;
+        }
+        offset += count;
+    }
+    return 0;
+}
+
+struct m5_display_live_maps {
+    struct t8142_display_reservation reservation;
+    dart_dev_t *dart;
+    u64 dram, dram_size, bytes;
+};
+
+/* The read-only walker coalesces only adjacent PA/IOVA pairs in the selected
+ * stream. Publish those actual mappings, never an assumed ADT remap address. */
+static int dt_m5_display_live_map(u64 iova, u64 size, void *opaque)
+{
+    struct m5_display_live_maps *maps = opaque;
+    u64 phys = (u64)dart_translate_silent(maps->dart, iova);
+    if (!size || size > 128 * SZ_1M || maps->bytes > 128 * SZ_1M - size ||
+        phys < maps->dram || phys - maps->dram >= maps->dram_size ||
+        size > maps->dram_size - (phys - maps->dram) ||
+        ((phys | size) & (SZ_16K - 1)))
+        return -1;
+    for (u64 offset = 0; offset < size; offset += SZ_16K)
+        if ((u64)dart_translate_silent(maps->dart, iova + offset) != phys + offset)
+            return -1;
+    if (dt_m5_reserve_display_phys(phys, size) ||
+        dt_t8142_reserve_iova(iova, size, &maps->reservation))
+        return -1;
+    maps->bytes += size;
+    return 0;
+}
+
 static int dt_reserve_m5_display_segments_for(const char *alias, const char *nub_path)
 {
     int owner = fdt_path_offset(dt, alias);
@@ -4573,7 +4617,8 @@ static int dt_reserve_m5_display_segments_for(const char *alias, const char *nub
         return 0;
     if (nub < 0 || chosen < 0 || ADT_GETPROP(adt, chosen, "dram-base", &dram) != sizeof(dram) ||
         ADT_GETPROP(adt, chosen, "dram-size", &dram_size) != sizeof(dram_size) ||
-        dram_size < SZ_16K || dram > UINT64_MAX - dram_size)
+        dram_size < SZ_16K || ((dram | dram_size) & (SZ_16K - 1)) ||
+        dram > UINT64_MAX - dram_size)
         bail("ADT: missing M5 display firmware memory bounds\n");
     segments = adt_getprop(adt, nub, "segment-ranges", &len);
     if (!segments || !len || len % sizeof(*segments) || len / sizeof(*segments) > 64)
@@ -4582,60 +4627,41 @@ static int dt_reserve_m5_display_segments_for(const char *alias, const char *nub
     if (!owner_phandle)
         bail("FDT: cannot allocate M5 display owner phandle\n");
     owner = fdt_node_offset_by_phandle(dt, owner_phandle);
+    int iommu = dt_get_iommu_node(owner, 0);
+    int range_len = 0;
+    const fdt64_t *range = iommu < 0 ? NULL : fdt_getprop(dt, iommu, "apple,dma-range", &range_len);
+    if (!range || range_len != 16)
+        bail("FDT: missing M5 display DMA window\n");
+    struct m5_display_live_maps maps = {
+        .reservation = {.device = alias, .phandle = owner_phandle,
+                        .bus_base = fdt64_ld(&range[0]), .bus_size = fdt64_ld(&range[1])},
+        .dram = dram, .dram_size = dram_size,
+    };
+    if (!maps.reservation.bus_size ||
+        maps.reservation.bus_base > UINT64_MAX - maps.reservation.bus_size)
+        bail("FDT: invalid M5 display DMA window\n");
     dart_dev_t *dart = dt_init_dart_by_node(owner, 0);
     if (!dart)
         bail("FDT: cannot inspect M5 display firmware translations\n");
+    maps.dart = dart;
 
     u64 total = 0;
     for (u32 i = 0; i < len / sizeof(*segments); i++) {
-        u64 start = segments[i].remap;
+        u64 phys = segments[i].phys;
         u64 size = ALIGN_UP((u64)segments[i].size, SZ_16K);
+        if (!size || size > 128 * SZ_1M || total > 128 * SZ_1M - size ||
+            (phys & (SZ_16K - 1)) || phys < dram || phys - dram >= dram_size ||
+            size > dram_size - (phys - dram))
+            bail_cleanup("ADT: unsupported M5 display physical segment\n");
+        if (dt_m5_reserve_display_phys(phys, size))
+            bail_cleanup("FDT: cannot reserve M5 display physical segment\n");
         total += size;
-        if (!size || (start & (SZ_16K - 1)) || start < (1ULL << 40) ||
-            start - (1ULL << 40) >= (1ULL << 36) || size > (1ULL << 36) - (start - (1ULL << 40)) ||
-            total > 128 * SZ_1M)
-            bail_cleanup("ADT: unsupported M5 display firmware segment\n");
-        for (u64 offset = 0; offset < size;) {
-            u64 iova = start + offset;
-            u64 phys = (u64)dart_translate(dart, iova);
-            if (phys < dram || phys - dram > dram_size - SZ_16K || (phys & (SZ_16K - 1)))
-                bail_cleanup("DART: invalid M5 display firmware page\n");
-            bool reserved = dt_display_phys_reserved(phys, SZ_16K);
-            u64 count = SZ_16K;
-            while (offset + count < size) {
-                u64 next = (u64)dart_translate(dart, iova + count);
-                if (next != phys + count || next < dram || next - dram > dram_size - SZ_16K ||
-                    dt_display_phys_reserved(next, SZ_16K) != reserved)
-                    break;
-                count += SZ_16K;
-            }
-            char name[64];
-            int node;
-            if (!reserved) {
-                snprintf(name, sizeof(name), "dcp-firmware@%lx", phys);
-                node = dt_get_or_add_reserved_mem(name, "apple,asc-mem", true, phys, count);
-            } else {
-                snprintf(name, sizeof(name), "dcp-iova-%lx", iova);
-                int parent = fdt_path_offset(dt, "/reserved-memory");
-                node = fdt_add_subnode(dt, parent, name);
-                if (node < 0)
-                    bail_cleanup("FDT: cannot add M5 display IOVA reservation\n");
-                u32 phandle;
-                if (fdt_generate_phandle(dt, &phandle) ||
-                    fdt_setprop_u32(dt, node, "phandle", phandle) ||
-                    fdt_setprop_string(dt, node, "compatible", "apple,asc-mem"))
-                    bail_cleanup("FDT: cannot describe M5 display IOVA reservation\n");
-            }
-            if (node < 0)
-                bail_cleanup("FDT: cannot reserve M5 display firmware\n");
-            u32 phandle = fdt_get_phandle(dt, node);
-            if (dt_device_set_reserved_mem(node, name, owner_phandle, iova, count) ||
-                dt_device_add_mem_region(alias, phandle, NULL))
-                bail_cleanup("FDT: cannot attach M5 display firmware reservation\n");
-            offset += count;
-        }
     }
-    printf("FDT: reserved live M5 display firmware segments (%lu bytes)\n", total);
+    if (dart_walk_inherited_range(dart, dram, dram_size, dt_m5_display_live_map, &maps) ||
+        !maps.bytes)
+        bail_cleanup("DART: cannot preserve live M5 display mappings\n");
+    printf("FDT: reserved M5 display storage (%lu bytes), live mappings (%lu bytes)\n",
+           (unsigned long)total, (unsigned long)maps.bytes);
 err:
     dart_shutdown(dart);
     return ret;
