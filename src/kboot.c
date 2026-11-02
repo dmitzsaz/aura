@@ -6670,7 +6670,8 @@ int kboot_prepare_dt(void *fdt)
         return -1;
     if (dt_disable_missing_devs("usb-drd", "usb@", 8, 0))
         return -1;
-    if (dt_disable_missing_devs("acio", "cio@", 8, 2))
+    /* T8142 splits the RC into separate regions; its base is reg[1]. */
+    if (dt_disable_missing_devs("acio", "cio@", 8, chip_id == T8142 ? 1 : 2))
         return -1;
     if (dt_disable_missing_devs("i2c", "i2c@", 8, 0))
         return -1;
