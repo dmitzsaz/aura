@@ -6514,6 +6514,9 @@ int kboot_prepare_dt(void *fdt)
     assert(dt_bufsize);
 
     dt_bufsize += 6 * SZ_16K; // Add 96K of buffer for modifications
+    // T8142 also takes the three ACIO tunable sets and the full PMP data.
+    if (chip_id == T8142)
+        dt_bufsize += 4 * SZ_16K;
     // A T6030 or T8122 also takes its PMP values
     if (chip_id == T6030 || chip_id == T8122)
         dt_bufsize += 2 * SZ_16K;
