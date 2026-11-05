@@ -37,6 +37,7 @@ typedef uint32_t u32;
 #define T6030 0x6030
 #define T6040 0x6040
 #define T8140 0x8140
+#define T8142 0x8142
 #define T8132 0x8132
 #define SZ_16K 16384
 #define ALIGN_UP(x, a) (((x) + (a) - 1) & ~((a) - 1))
@@ -86,6 +87,7 @@ static int dt_get_or_add_reserved_mem(const char *name, const char *compat,
     assert(!fdt_setprop(dt, node, "reg", reg, sizeof(reg)));
     return node;
 }
+static int dt_set_isp_t8142(void) { assert(0); return -1; }
 static int fwdata_fault;
 static int dt_set_isp_fwdata(void)
 {

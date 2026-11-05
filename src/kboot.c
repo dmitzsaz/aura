@@ -7690,6 +7690,63 @@ static int dt_set_isp_fwdata(void)
     return 0;
 }
 
+/* Reserve the stopped T8142 ISP without allocating a second firmware heap. */
+static int dt_set_isp_t8142(void)
+{
+    static const char region_names[] = "heap\0text\0data";
+    const char *path = "/arm-io/isp";
+    int node = fdt_path_offset(dt, "isp");
+    int len;
+
+    if (node < 0)
+        return 0;
+    if (fdt_node_check_compatible(dt, node, "apple,t8142-isp"))
+        return -1;
+
+    /* The platform describes an IOVA aperture, not another RAM allocation. */
+    const char *names = fdt_getprop(dt, node, "memory-region-names", &len);
+    if (!names || len != sizeof("heap") || memcmp(names, "heap", len))
+        return -1;
+    const fdt32_t *ref = fdt_getprop(dt, node, "memory-region", &len);
+    if (!ref || len != sizeof(*ref))
+        return -1;
+    int heap = fdt_node_offset_by_phandle(dt, fdt32_ld(ref));
+    if (heap < 0 || fdt_getprop(dt, heap, "reg", NULL))
+        return -1;
+    const fdt32_t *map = fdt_getprop(dt, heap, "iommu-addresses", &len);
+    u32 phandle = fdt_get_phandle(dt, node);
+    if (!map || len != 5 * sizeof(*map) || !phandle || fdt32_ld(map) != phandle ||
+        fdt32_ld(map + 1) || fdt32_ld(map + 2) || fdt32_ld(map + 3) ||
+        fdt32_ld(map + 4) != 0x1700000)
+        return -1;
+
+    int adt_node = adt_path_offset(adt, path);
+    if (adt_node < 0) {
+        path = "/arm-io/isp0";
+        adt_node = adt_path_offset(adt, path);
+    }
+    if (adt_node < 0)
+        return -1;
+    u32 bytes;
+    const struct adt_segment_ranges *seg = adt_getprop(adt, adt_node, "segment-ranges", &bytes);
+    if (!seg || bytes != 2 * sizeof(*seg) || seg[0].iova || !seg[0].size || !seg[1].size ||
+        seg[1].iova != seg[0].size || (u64)seg[0].size + seg[1].size >= 0x1700000 ||
+        ((seg[0].phys | seg[1].phys | seg[0].size | seg[1].size) & (SZ_16K - 1)) ||
+        seg[0].phys > UINT64_MAX - seg[0].size || seg[1].phys > UINT64_MAX - seg[1].size ||
+        (seg[0].phys < seg[1].phys + seg[1].size && seg[1].phys < seg[0].phys + seg[0].size))
+        return -1;
+
+    if (dt_reserve_asc_firmware(path, NULL, "isp", false, 0))
+        return -1;
+    node = fdt_path_offset(dt, "isp");
+    if (node < 0 || fdt_setprop(dt, node, "memory-region-names", region_names, sizeof(region_names)))
+        return -1;
+    if (firmware_set_fdt(dt, node, "apple,firmware-version", &os_firmware))
+        return -1;
+    node = fdt_path_offset(dt, "isp");
+    return node < 0 ? -1 : firmware_set_fdt(dt, node, "apple,firmware-compat", &os_firmware);
+}
+
 /*
  * The camera is optional. Without a valid ADT firmware description, or if its firmware or heap
  * reservation fails, disable the ISP and boot on without it instead of failing the whole handoff.
@@ -7703,8 +7760,10 @@ static int dt_set_isp(void)
         !fdt_node_check_compatible(dt, 0, "apple,j614s"))
         return 0;
 
-    /* A T8140 ISP that isp_init() did not bring up has no firmware to reserve. */
-    if (chip_id == T8140 && isp_get_heap(&heap_phys, &heap_iova, &heap_size)) {
+    if (chip_id == T8142) {
+        if (!dt_set_isp_t8142())
+            return 0;
+    } else if (chip_id == T8140 && isp_get_heap(&heap_phys, &heap_iova, &heap_size)) {
         if (!dt_set_isp_fwdata())
             return 0;
     } else if (!dt_reserve_asc_firmware("/arm-io/isp", "/arm-io/isp0", "isp", false,
@@ -7720,6 +7779,22 @@ static int dt_set_isp(void)
     if (fdt_setprop_string(dt, node, "status", "disabled") < 0)
         return -1;
     return 0;
+}
+
+/* A failed protection-filter setup leaves the optional camera unavailable. */
+static int dt_finish_isp_t8142(int dapf_result)
+{
+    if (dapf_result >= 0)
+        return 0;
+    if (fdt_open_into(dt, dt, dt_bufsize))
+        return -1;
+    int node = fdt_path_offset(dt, "isp");
+    if (node >= 0) {
+        if (fdt_setprop_string(dt, node, "status", "disabled"))
+            return -1;
+        printf("FDT: DAPF preparation failed; camera disabled\n");
+    }
+    return fdt_pack(dt);
 }
 
 /* J700 is sold both with and without a built-in Touch ID sensor.  A paired
@@ -9236,6 +9311,8 @@ int kboot_boot(void *kernel)
     }
     ret = (chip_id == T8142 || chip_id == T6041 || chip_id == T8132) ? dapf_init_fdt(dt)
                                                                      : dapf_init_all();
+    if (chip_id == T8142 && dt_finish_isp_t8142(ret))
+        return -1;
     if (ret < 0 && chip_id == T8140) {
         printf("kboot: refusing T8140 handoff after DAPF failure\n");
         pcie_shutdown();
