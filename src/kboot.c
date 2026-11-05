@@ -3504,10 +3504,13 @@ static int dt_vram_reserved_region(const char *dcp_alias, const char *disp_alias
  * Reserve the firmware segments of an ASC coprocessor from its ADT
  * segment-ranges and attach them to its FDT node. With dram_only, segments
  * outside DRAM (such as the coprocessor's own SRAM, which the OS maps as MMIO)
- * are left out.
+ * are left out. Without iommu, the regions carry no iommu-addresses: the
+ * coprocessor keeps running on the DART mappings iBoot set up, and the OS only
+ * has to keep the memory out of its allocator.
  */
 static int dt_reserve_asc_segments(const char *adt_path, const char *adt_path_alt,
-                                   const char *fdt_path, bool remap, u64 base, bool dram_only)
+                                   const char *fdt_path, bool remap, u64 base, bool dram_only,
+                                   bool iommu)
 {
     int ret = 0;
 
@@ -3587,7 +3590,7 @@ static int dt_reserve_asc_segments(const char *adt_path, const char *adt_path_al
         if ((chip_id == T6030 || chip_id == T8132) && !strncmp(fdt_path, "dcp", 3) &&
             seg->unk == 0xa)
             ret = fdt_setprop_empty(dt, mem_node, "apple,dcp-os-log");
-        else
+        else if (iommu)
             ret = dt_device_set_reserved_mem(mem_node, node_name, dev_phandle, iova, seg_size);
         if (ret < 0)
             return ret;
@@ -3603,7 +3606,7 @@ static int dt_reserve_asc_segments(const char *adt_path, const char *adt_path_al
 static int dt_reserve_asc_firmware(const char *adt_path, const char *adt_path_alt,
                                    const char *fdt_path, bool remap, u64 base)
 {
-    return dt_reserve_asc_segments(adt_path, adt_path_alt, fdt_path, remap, base, false);
+    return dt_reserve_asc_segments(adt_path, adt_path_alt, fdt_path, remap, base, false, true);
 }
 
 /*
@@ -7329,7 +7332,7 @@ static int dt_set_t8132_aop(const char *path)
         why = "its DAPF is not programmed";
         goto disable;
     }
-    if (dt_reserve_asc_segments("/arm-io/aop/iop-aop-nub", NULL, path, true, 0, true)) {
+    if (dt_reserve_asc_segments("/arm-io/aop/iop-aop-nub", NULL, path, true, 0, true, true)) {
         why = "its firmware segments are not reserved";
         goto disable;
     }
@@ -7393,6 +7396,33 @@ static void dt_set_aop_motion_cal(const char *path)
 }
 
 /*
+ * T8142 coprocessors that iBoot leaves running keep part of their firmware,
+ * among it their log (__OS_LOG), in DRAM that the OS would otherwise hand out.
+ * Reserve those segments and list them in the node's memory-region. They get
+ * no iommu-addresses: the firmware keeps the DART mappings iBoot set up.
+ * Without the reservation the node is disabled; the boot goes on.
+ */
+static void dt_reserve_t8142_asc_dram(const char *adt_path, const char *path)
+{
+    if (!dt_reserve_asc_segments(adt_path, NULL, path, true, 0, true, false)) {
+        printf("FDT: %s: firmware DRAM segments reserved\n", path);
+        return;
+    }
+
+    printf("FDT: %s: reserving the firmware DRAM segments failed, disabling it\n", path);
+    int node = fdt_path_offset(dt, path);
+    if (node < 0 || fdt_setprop_string(dt, node, "status", "disabled"))
+        printf("FDT: %s: cannot disable it\n", path);
+}
+
+static bool dt_node_okay(int node)
+{
+    const char *status = fdt_getprop(dt, node, "status", NULL);
+
+    return !status || !strcmp(status, "okay") || !strcmp(status, "ok");
+}
+
+/*
  * The T6040/T6041 AOP runs its __TEXT and __DATA from its own SRAM, but iBoot
  * leaves its external code (__ETEXT) and its log (__OS_LOG) in DRAM. Reserve
  * those segments with the IOVAs the firmware uses for them (their remap
@@ -7401,16 +7431,19 @@ static void dt_set_aop_motion_cal(const char *path)
  */
 static int dt_set_aop_firmware(void)
 {
-    if (chip_id != T6040 && chip_id != T6041 && chip_id != T8132)
+    const char *compat;
+
+    if (chip_id == T6040 || chip_id == T6041)
+        compat = "apple,t6041-aop";
+    else if (chip_id == T8132)
+        compat = "apple,t8132-aop";
+    else if (chip_id == T8142)
+        compat = "apple,t8142-aop";
+    else
         return 0;
 
-    int node = fdt_node_offset_by_compatible(
-        dt, -1, chip_id == T8132 ? "apple,t8132-aop" : "apple,t6041-aop");
-    if (node < 0)
-        return 0;
-
-    const char *status = fdt_getprop(dt, node, "status", NULL);
-    if (status && strcmp(status, "okay") && strcmp(status, "ok"))
+    int node = fdt_node_offset_by_compatible(dt, -1, compat);
+    if (node < 0 || !dt_node_okay(node))
         return 0;
 
     char path[64];
@@ -7423,6 +7456,10 @@ static int dt_set_aop_firmware(void)
 
     if (chip_id == T8132)
         return dt_set_t8132_aop(path);
+    if (chip_id == T8142) {
+        dt_reserve_t8142_asc_dram("/arm-io/aop", path);
+        return 0;
+    }
 
     u32 len = 0;
     int anode = adt_path_offset(adt, "/arm-io/aop");
@@ -7432,7 +7469,7 @@ static int dt_set_aop_firmware(void)
         return 0;
     }
 
-    if (dt_reserve_asc_segments("/arm-io/aop", NULL, path, true, 0, true))
+    if (dt_reserve_asc_segments("/arm-io/aop", NULL, path, true, 0, true, true))
         printf("FDT: %s: reserving the AOP firmware segments failed\n", path);
     else
         printf("FDT: %s: AOP firmware segments reserved\n", path);
