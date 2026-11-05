@@ -21,6 +21,7 @@
 #include "isp.h"
 #include "kboot_atc.h"
 #include "kboot_audio.h"
+#include "kboot_nvme.h"
 #include "kboot_display_facts.h"
 #include "kboot_gpu_t8122.h"
 #include "kboot_pmp_t8122.h"
@@ -8951,6 +8952,8 @@ int kboot_prepare_dt(void *fdt)
     if (dt_set_aop_firmware())
         return -1;
     dt_set_mtp_firmware();
+    if (dt_set_t8142_nvme(dt))
+        return -1;
     if (dt_set_isp())
         return -1;
     if (dt_set_pmgr())
