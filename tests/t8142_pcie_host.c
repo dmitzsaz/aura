@@ -310,6 +310,10 @@ int dart_walk_locked_t8110(uintptr_t base, u64 size, u8 sid, u64 dram, u64 dram_
         return 0;
     if (scenario == 32 && base == DART_EXT_FW)
         return 0;
+    if ((scenario == 33 && base == DART_SCAN && sid == 0) ||
+        (scenario == 34 && base == DART_SCAN && sid == 16) ||
+        (scenario == 35 && base == DART_FW))
+        return 0;
     if (visit(0, DRAM + 0x100000, opaque) || visit(SZ_16K, DRAM + 0x104000, opaque))
         return -1;
     /* MMIO must reserve its IOVA without being claimed as system RAM. */
@@ -421,7 +425,8 @@ static void check_display(void)
     void *dt = calloc(1, capacity);
     display_tree(dt, capacity);
     int ret = kboot_t8142_display_reserve(dt, "dcp");
-    if (scenario == 22 || scenario == 24 || scenario == 26 || scenario == 28) {
+    if (scenario == 22 || scenario == 24 || scenario == 26 || scenario == 28 ||
+        (scenario >= 33 && scenario <= 35)) {
         assert(ret);
         assert(!strcmp(fdt_getprop(dt, fdt_path_offset(dt, "dcp"), "status", NULL), "disabled"));
         free(dt);
@@ -445,11 +450,15 @@ static void check_display(void)
     assert(!ret);
     bool external = scenario == 21 || scenario == 27 || (scenario >= 29 && scenario <= 31);
     if (external || scenario == 23 || scenario == 32) {
+        int reservations = fdt_num_mem_rsv(dt);
         ret = kboot_t8142_display_reserve(dt, "dcpext1");
         if (scenario == 23 || scenario == 32)
             assert(ret);
-        else
+        else {
             assert(!ret && !kboot_t8142_display_enable(dt, "dcpext1"));
+            /* Even an empty frontend keeps all three inherited roots alive. */
+            assert(fdt_num_mem_rsv(dt) >= reservations + 3);
+        }
     }
     if (external) {
         int route = fdt_path_offset(dt, "/dcpext1/typec-routes/route@0");
