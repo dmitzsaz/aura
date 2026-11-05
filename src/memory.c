@@ -6,6 +6,7 @@
 #include "cpu_regs.h"
 #include "fb.h"
 #include "gxf.h"
+#include "heapblock.h"
 #include "malloc.h"
 #include "mcc.h"
 #include "smp.h"
@@ -50,6 +51,62 @@ static u64 firmware_ro_start;
 static u64 firmware_ro_end;
 static bool firmware_ro_checked;
 static bool firmware_ro_valid;
+
+bool memory_get_mte_tag_storage(u64 *base, u64 *size)
+{
+    *base = *size = 0;
+
+    /* T8142's ADT identifies the MTE tag backing store only by region ID. */
+    if (chip_id != T8142)
+        return false;
+
+    int chosen = adt_path_offset(adt, "/chosen");
+    int carveouts = adt_path_offset(adt, "/chosen/carveout-memory-map");
+    u64 dram_base, dram_size, region[2];
+    if (chosen < 0 || carveouts < 0 ||
+        ADT_GETPROP(adt, chosen, "dram-base", &dram_base) != sizeof(dram_base) ||
+        ADT_GETPROP(adt, chosen, "dram-size", &dram_size) != sizeof(dram_size) ||
+        ADT_GETPROP_ARRAY(adt, carveouts, "region-id-218", region) != sizeof(region)) {
+        printf("ADT: WARNING: missing or malformed MTE tag storage description, skipping\n");
+        return false;
+    }
+
+    /* Four tag bits per 16 bytes of DRAM. Check containment without wrapping. */
+    if (!dram_size || dram_size > UINT64_MAX - dram_base || (dram_size & 31) || !region[1] ||
+        region[1] != dram_size / 32 || ((region[0] | region[1]) & (SZ_16K - 1)) ||
+        region[0] < dram_base || region[1] > dram_size ||
+        region[0] - dram_base > dram_size - region[1]) {
+        printf("ADT: WARNING: invalid MTE tag storage 0x%lx+0x%lx for DRAM 0x%lx+0x%lx, "
+               "skipping\n",
+               region[0], region[1], dram_base, dram_size);
+        return false;
+    }
+
+    *base = region[0];
+    *size = region[1];
+    return true;
+}
+
+void memory_reserve_mte_tag_storage(void)
+{
+    u64 base, size;
+    if (!memory_get_mte_tag_storage(&base, &size))
+        return;
+
+    u64 ram_start = cur_boot_args.phys_base;
+    u64 ram_size = cur_boot_args.mem_size;
+    if (ram_size > UINT64_MAX - ram_start)
+        panic("MTE: invalid usable RAM interval\n");
+    if (base >= ram_start + ram_size || base + size <= ram_start)
+        return;
+    if (base <= ram_start || base <= heapblock_high_water())
+        panic("MTE: tag storage overlaps aura's heap\n");
+
+    /* Keep both aura allocators below the tag store, including retained firmware buffers. */
+    cur_boot_args.mem_size = base - ram_start;
+    heapblock_set_limit((void *)base);
+    printf("MTE: limiting usable RAM to 0x%lx before tag storage\n", base);
+}
 
 int memory_fw_ro_range(u64 *start, u64 *end)
 {

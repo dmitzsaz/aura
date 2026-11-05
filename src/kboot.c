@@ -880,6 +880,32 @@ static int dt_set_uboot_config(void)
     return 0;
 }
 
+static int dt_reserve_mte_tag_storage(u64 *base, u64 *size)
+{
+    *base = *size = 0;
+
+    if (!memory_get_mte_tag_storage(base, size))
+        return 0;
+
+    int parent = fdt_path_offset(dt, "/reserved-memory");
+    int len;
+    if (parent < 0 || fdt_address_cells(dt, 0) != 2 || fdt_size_cells(dt, 0) != 2 ||
+        fdt_address_cells(dt, parent) != 2 || fdt_size_cells(dt, parent) != 2 ||
+        !fdt_getprop(dt, parent, "ranges", &len) || len)
+        bail("FDT: invalid /reserved-memory for MTE tag storage\n");
+
+    char name[40];
+    snprintf(name, sizeof(name), "mte-tag-storage@%lx", *base);
+    int node = fdt_add_subnode(dt, parent, name);
+    fdt64_t reg[2] = {cpu_to_fdt64(*base), cpu_to_fdt64(*size)};
+    if (node < 0 || fdt_setprop(dt, node, "reg", reg, sizeof(reg)) ||
+        fdt_setprop_empty(dt, node, "no-map"))
+        bail("FDT: couldn't reserve MTE tag storage\n");
+
+    printf("FDT: MTE tag storage reserved at 0x%lx+0x%lx (no-map)\n", *base, *size);
+    return 0;
+}
+
 static int dt_set_memory(void)
 {
     int anode = adt_path_offset(adt, "/chosen");
@@ -909,6 +935,10 @@ static int dt_set_memory(void)
 
     printf("FDT: DRAM at 0x%lx size 0x%lx\n", dram_base, dram_size);
     printf("FDT: Usable memory is 0x%lx..0x%lx (0x%lx)\n", dram_min, dram_max, dram_max - dram_min);
+
+    u64 mte_base, mte_size;
+    if (dt_reserve_mte_tag_storage(&mte_base, &mte_size))
+        return -1;
 
     struct {
         fdt64_t start;
@@ -972,6 +1002,41 @@ static int dt_set_memory(void)
             memreg[num_regions].start = cpu_to_fdt64(resv_start);
             memreg[num_regions++].size = cpu_to_fdt64(resv_len);
         }
+    }
+
+    /*
+     * U-Boot chooses its relocation address and heap before consuming reserved-memory.
+     * Keep the tag store out of /memory too, including any firmware RAM added above.
+     */
+    if (mte_size) {
+        u64 mte_end = mte_base + mte_size;
+        for (int i = 0; i < num_regions; i++) {
+            u64 start = fdt64_to_cpu(memreg[i].start);
+            u64 end = start + fdt64_to_cpu(memreg[i].size);
+            if (start >= mte_end || end <= mte_base)
+                continue;
+
+            if (start < mte_base && end > mte_end) {
+                if (num_regions == MAX_MEM_REGIONS)
+                    bail("FDT: Out of memory regions for MTE tag storage\n");
+                memmove(&memreg[i + 2], &memreg[i + 1], (num_regions - i - 1) * sizeof(memreg[0]));
+                memreg[i].size = cpu_to_fdt64(mte_base - start);
+                memreg[i + 1].start = cpu_to_fdt64(mte_end);
+                memreg[i + 1].size = cpu_to_fdt64(end - mte_end);
+                num_regions++;
+            } else if (start < mte_base) {
+                memreg[i].size = cpu_to_fdt64(mte_base - start);
+            } else if (end > mte_end) {
+                memreg[i].start = cpu_to_fdt64(mte_end);
+                memreg[i].size = cpu_to_fdt64(end - mte_end);
+            } else {
+                memmove(&memreg[i], &memreg[i + 1], (num_regions - i - 1) * sizeof(memreg[0]));
+                num_regions--;
+                i--;
+            }
+        }
+        if (!num_regions)
+            bail("FDT: No usable RAM outside MTE tag storage\n");
     }
 
     int node = fdt_path_offset(dt, "/memory");
@@ -8582,6 +8647,12 @@ static int dt_setup_mtd_phram(void)
         u64 pa = parse_hex_u64(chosen_params[i][1]);
         if (!pa || pa & (SZ_16K - 1))
             break;
+        u64 mte_base, mte_size;
+        if (memory_get_mte_tag_storage(&mte_base, &mte_size) && pa >= mte_base &&
+            pa - mte_base < mte_size) {
+            printf("FDT: skipping stage 1 log inside MTE tag storage\n");
+            break;
+        }
         snprintf(node_name, sizeof(node_name), "flash@%lx", pa);
         node = dt_get_or_add_reserved_mem(node_name, "phram", false, pa, SZ_16K);
         if (node > 0 && fdt_setprop_string(dt, node, "label", "aura_stage1.log"))

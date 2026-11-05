@@ -11,6 +11,10 @@ def test_reserved_memory_reg_alignment(tmp_path):
     source = Path(os.environ.get("AURA_MEMORY_SOURCE", repo / "src/kboot.c")).read_text()
     start = source.index("static int dt_set_memory(void)")
     function = source[start:source.index("\nstatic ", start + 1)]
+    # MTE carve-outs have their own ADT integration tests; exercise the RAM-map loads here.
+    if "dt_reserve_mte_tag_storage(" in function:
+        function = ("static int dt_reserve_mte_tag_storage(u64 *base, u64 *size)\n"
+                    "{ *base = *size = 0; return 0; }\n" + function)
     program = r'''
 #include <assert.h>
 #include <stdint.h>

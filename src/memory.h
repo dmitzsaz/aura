@@ -76,6 +76,8 @@ void dcsw_op_all(u64 op_type);
 
 void mmu_init(void);
 int memory_fw_ro_range(u64 *start, u64 *end);
+bool memory_get_mte_tag_storage(u64 *base, u64 *size);
+void memory_reserve_mte_tag_storage(void);
 int mmu_init_secondary(int cpu);
 void mmu_init_secondary_local(void);
 void mmu_publish_secondary(void);

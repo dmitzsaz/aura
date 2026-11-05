@@ -334,6 +334,7 @@ void aura_main(void)
     firmware_init();
 
     heapblock_init();
+    memory_reserve_mte_tag_storage();
 
     if (chip_id == T8152) {
         j873g_run_proxy();
