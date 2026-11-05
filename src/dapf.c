@@ -609,6 +609,17 @@ int dapf_init_fdt(const void *fdt)
             entry++;
             continue;
         }
+        /*
+         * T8142's ISP DART has no clock gates of its own: its DAPF is only
+         * reachable while the ISP power domains are up, which the loader does
+         * not raise on this SoC (Linux starts the resident ISP firmware).
+         * Writing it here raises an SError, so leave it as iBoot set it.
+         */
+        if (chip_id == T8142 && !strcmp(entry->alias, "isp")) {
+            printf("dapf: preserving inherited %s state on T8142\n", entry->path);
+            entry++;
+            continue;
+        }
         /* Only prepare DMA for devices handed to the next stage. In
          * particular, an initial J813 FDT has no AOP, MTP, PMP or ISP.
          * Their firmware-owned protection registers must remain intact.
