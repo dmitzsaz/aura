@@ -31,6 +31,6 @@ def producer(tmp_path_factory):
     return binary
 
 
-@pytest.mark.parametrize("scenario", range(29))
+@pytest.mark.parametrize("scenario", range(33))
 def test_producer(producer, scenario):
     subprocess.run([str(producer), str(scenario)], check=True)

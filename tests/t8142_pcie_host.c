@@ -304,6 +304,12 @@ int dart_walk_locked_t8110(uintptr_t base, u64 size, u8 sid, u64 dram, u64 dram_
         return -1;
     if (scenario == 23 && base == DART_EXT_SCAN)
         return -1;
+    /* iBoot's idle external pipe: locked, translating, but no buffers yet. */
+    if (scenario >= 29 && scenario <= 31 && base == DART_EXT_SCAN &&
+        (scenario == 29 || sid == (scenario == 30 ? 0 : 16)))
+        return 0;
+    if (scenario == 32 && base == DART_EXT_FW)
+        return 0;
     if (visit(0, DRAM + 0x100000, opaque) || visit(SZ_16K, DRAM + 0x104000, opaque))
         return -1;
     /* MMIO must reserve its IOVA without being claimed as system RAM. */
@@ -380,6 +386,24 @@ static void display_tree(void *dt, int capacity)
         if (i == 1 || i == 3)
             assert(!fdt_setprop_u32(dt, n, "clocks", 20));
     }
+    for (int i = 0; i < 3; i++) {
+        char name[16];
+        snprintf(name, sizeof(name), "power%d", i);
+        int n = fdt_add_subnode(dt, 0, name);
+        assert(n >= 0);
+        assert(!fdt_setprop_u32(dt, n, "phandle", 30 + i));
+        assert(!fdt_setprop_u32(dt, n, "#power-domain-cells", 0));
+        assert(!fdt_setprop_string(dt, n, "status", "disabled"));
+        if (i)
+            assert(!fdt_setprop_u32(dt, n, "power-domains", 29 + i));
+    }
+    int ext = fdt_path_offset(dt, "/dcpext1");
+    assert(!fdt_setprop_u32(dt, ext, "power-domains", 32));
+    assert(!fdt_setprop_u32(dt, ext, "mboxes", 33));
+    int mailbox = fdt_add_subnode(dt, 0, "mailbox");
+    assert(mailbox >= 0);
+    assert(!fdt_setprop_u32(dt, mailbox, "phandle", 33));
+    assert(!fdt_setprop_string(dt, mailbox, "status", "disabled"));
     int external = fdt_path_offset(dt, "/dcpext1");
     int routes = fdt_add_subnode(dt, external, "typec-routes");
     int route = fdt_add_subnode(dt, routes, "route@0");
@@ -419,21 +443,26 @@ static void check_display(void)
         return;
     }
     assert(!ret);
-    if (scenario == 21 || scenario == 23 || scenario == 27) {
+    bool external = scenario == 21 || scenario == 27 || (scenario >= 29 && scenario <= 31);
+    if (external || scenario == 23 || scenario == 32) {
         ret = kboot_t8142_display_reserve(dt, "dcpext1");
-        if (scenario == 23)
+        if (scenario == 23 || scenario == 32)
             assert(ret);
         else
             assert(!ret && !kboot_t8142_display_enable(dt, "dcpext1"));
     }
-    if (scenario == 21 || scenario == 27) {
+    if (external) {
         int route = fdt_path_offset(dt, "/dcpext1/typec-routes/route@0");
         assert(!strcmp(fdt_getprop(dt, route, "status", NULL), "okay"));
+    }
+    for (u32 phandle = 30; phandle <= 33; phandle++) {
+        int node = fdt_node_offset_by_phandle(dt, phandle);
+        assert(!strcmp(fdt_getprop(dt, node, "status", NULL), external ? "okay" : "disabled"));
     }
     assert(!kboot_t8142_display_prune(dt));
     int master = fdt_path_offset(dt, "disp0"), len;
     const fdt32_t *iommus = fdt_getprop(dt, master, "iommus", &len);
-    assert(iommus && len == (scenario == 21 || scenario == 27 ? 16 : 8));
+    assert(iommus && len == (external ? 16 : 8));
     assert(!strcmp(fdt_getprop(dt, fdt_path_offset(dt, "dcp"), "status", NULL), "okay"));
     const fdt32_t *rate =
         fdt_getprop(dt, fdt_path_offset(dt, "/clock-display-video"), "clock-frequency", &len);
