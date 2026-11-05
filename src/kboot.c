@@ -19,7 +19,6 @@
 #include "heapblock.h"
 #include "iodev.h"
 #include "isp.h"
-#include "j813_n1.h"
 #include "kboot_atc.h"
 #include "kboot_audio.h"
 #include "kboot_display_facts.h"
@@ -9034,9 +9033,9 @@ int kboot_prepare_dt(void *fdt)
         !fdt_node_check_compatible(dt, 0, "apple,j614s") && dt_split_j614s_sep_reservations())
         bail("FDT: could not split J614s SEP reservations\n");
 
-    /* J813: train the N1 Wi-Fi/Bluetooth link, or disable its ECAM host. */
-    if (j813_n1_prepare(dt))
-        bail("FDT: J813 N1 preparation failed\n");
+    /* T8142: train the internal PCIe links, or disable their ECAM host. */
+    if (pcie_t8142_prepare_fdt(dt))
+        bail("FDT: T8142 PCIe preparation failed\n");
 
     /* T8140 PCIe status is known only after pcie_init() in kboot_boot(). */
     if (chip_id != T8140 && fdt_pack(dt))
