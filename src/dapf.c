@@ -3,6 +3,7 @@
 #include "dapf.h"
 #include "adt.h"
 #include "assert.h"
+#include "exception.h"
 #include "malloc.h"
 #include "memory.h"
 #include "pmgr.h"
@@ -71,7 +72,7 @@ struct dapf_t8110b_config {
     u32 pad;
 } PACKED;
 
-static int dapf_init_t8110a(u64 base, struct dapf_t8110_config *config, u32 length)
+static int dapf_init_t8110a(u64 base, const struct dapf_t8110_config *config, u32 length)
 {
     int count = length / sizeof(*config);
 
@@ -132,6 +133,65 @@ static int dapf_init_t8110(const char *path, u64 base, int node)
         printf("dapf: Invalid length for %s property %s\n", path, prop);
         return -1;
     }
+}
+
+/* The ISP DART has no clock-gates: its filter belongs to ISP_SYS. */
+static int dapf_init_t8142_isp(const char *path, u64 base, u64 size, int node)
+{
+    u32 length = 0;
+    const struct dapf_t8110_config *config = adt_getprop(adt, node, "dapf-instance-0", &length);
+
+    if (!adt_is_compatible(adt, node, "dart,t8110") || !config || !length ||
+        length % sizeof(*config) || size != SZ_16K || (base & (SZ_16K - 1)) ||
+        base > UINT64_MAX - size || length / sizeof(*config) > size / 0x40)
+        return -1;
+    unsigned int count = length / sizeof(*config);
+    for (unsigned int i = 0; i < count; i++) {
+        if (config[i].start > config[i].end)
+            return -1;
+    }
+
+    /*
+     * Keep the system domain on across the handoff, as on T8140. The CPU
+     * subdomains remain untouched: Linux starts the stopped resident ISP.
+     * Guard even the power check, and drain asynchronous errors before
+     * restoring the caller's guard, so an optional camera cannot kill boot.
+     */
+    enum exc_guard_t previous = exc_guard;
+    int faults = exc_count;
+    int ret = -1;
+    exc_guard = GUARD_SKIP | GUARD_SILENT;
+    if (pmgr_power_on(0, "ISP_SYS") || exc_count != faults || pmgr_power_is_on(0, "ISP_SYS") != 1 ||
+        exc_count != faults)
+        goto out;
+
+    dapf_init_t8110a(base, config, length);
+    sysop("dsb sy");
+    sysop("isb");
+    if (exc_count != faults)
+        goto out;
+
+    for (unsigned int i = 0; i < count; i++) {
+        u64 entry = base + i * 0x40;
+        u32 enable = (config[i].r0_hi << 4) | config[i].r0_lo;
+        if (read32(entry) != enable || read32(entry + 4) != config[i].r4 ||
+            read64(entry + 8) != config[i].start ||
+            (read64(entry + 0x10) | 3) != (config[i].end | 3) ||
+            read32(entry + 0x20) != config[i].r20 || exc_count != faults)
+            goto out;
+    }
+    ret = 0;
+out:
+    sysop("dsb sy");
+    sysop("isb");
+    if (exc_count != faults)
+        ret = -1;
+    exc_guard = previous;
+    if (ret)
+        printf("dapf: ISP power/filter preparation failed for %s\n", path);
+    else
+        printf("dapf: Initialized %s with ISP_SYS active (%u windows)\n", path, count);
+    return ret;
 }
 
 enum dapf_instance_type {
@@ -413,6 +473,8 @@ bool dapf_j614s_isp_ready(void)
 int dapf_init(const char *path, int index)
 {
     int ret = -1;
+    bool t8142_isp = chip_id == T8142 &&
+                     (!strcmp(path, "/arm-io/dart-isp") || !strcmp(path, "/arm-io/dart-isp0"));
     int dart_path[8];
     int node = adt_path_offset_trace(adt, path, dart_path);
     if (node < 0) {
@@ -447,6 +509,8 @@ int dapf_init(const char *path, int index)
      */
     u32 inst_len;
     const char *inst = adt_getprop(adt, node, "instance", &inst_len);
+    if (t8142_isp && (!inst || inst_len < 16 || inst_len % 16))
+        goto out;
     if (inst && inst_len >= 16 && !(inst_len % 16)) {
         int found = -1;
         for (u32 i = 0; i < inst_len / 16; i++) {
@@ -457,6 +521,8 @@ int dapf_init(const char *path, int index)
         }
         if (found < 0) {
             printf("dapf: %s has no DAPF instance; leaving it to firmware\n", path);
+            if (t8142_isp)
+                goto out;
             ret = 0;
             goto out_nodapf;
         }
@@ -465,9 +531,14 @@ int dapf_init(const char *path, int index)
         index = found;
     }
 
-    u64 base;
-    if (adt_get_reg(adt, dart_path, "reg", index, &base, NULL) < 0) {
+    u64 base, size;
+    if (adt_get_reg(adt, dart_path, "reg", index, &base, &size) < 0) {
         printf("dapf: Error getting DAPF %s base address.\n", path);
+        goto out;
+    }
+
+    if (t8142_isp) {
+        ret = dapf_init_t8142_isp(path, base, size, node);
         goto out;
     }
 
@@ -606,17 +677,6 @@ int dapf_init_fdt(const void *fdt)
         if (chip_id == T8140 && strcmp(entry->path, "/arm-io/dart-mtp") &&
             strcmp(entry->path, "/arm-io/dart-pmp")) {
             printf("dapf: preserving inherited %s state on T8140\n", entry->path);
-            entry++;
-            continue;
-        }
-        /*
-         * T8142's ISP DART has no clock gates of its own: its DAPF is only
-         * reachable while the ISP power domains are up, which the loader does
-         * not raise on this SoC (Linux starts the resident ISP firmware).
-         * Writing it here raises an SError, so leave it as iBoot set it.
-         */
-        if (chip_id == T8142 && !strcmp(entry->alias, "isp")) {
-            printf("dapf: preserving inherited %s state on T8142\n", entry->path);
             entry++;
             continue;
         }

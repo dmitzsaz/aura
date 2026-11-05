@@ -32,6 +32,13 @@ _Static_assert(sizeof(u64) == 8, "the aura host fixture requires an LP64 host");
 #define T6040 0x6040
 #define T8132 0x8132
 #define T8140 0x8140
+#define T8142 0x8142
+enum exc_guard_t { GUARD_SKIP = 1, GUARD_SILENT = 0x100 };
+static enum exc_guard_t exc_guard;
+static int exc_count;
+#define sysop(op) ((void)0)
+static int pmgr_power_on(int die, const char *name) { assert(0); return -1; }
+static int pmgr_power_is_on(int die, const char *name) { assert(0); return -1; }
 #define PMGR_FLAG_VIRTUAL 0x10
 #define PMGR_DEVICE_ID 0xffffU
 #define PMGR_DIE_ID 0xffff0000U
