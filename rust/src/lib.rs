@@ -22,6 +22,7 @@ pub mod float;
 #[cfg(feature = "chainload")]
 pub mod gpt;
 pub mod gpu;
+pub mod gpu_fwid;
 #[cfg(feature = "chainload")]
 pub mod nvme;
 pub mod print;

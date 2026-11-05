@@ -8,6 +8,7 @@
 #include "gfx_fw_image_info.h"
 #include "kboot_gpu_t6031.h"
 #include "kboot_gpu_t8122_power.h"
+#include "kboot_gpu_t8142.h"
 #include "kboot_t6031.h"
 #include "malloc.h"
 #include "math.h"
@@ -3681,8 +3682,15 @@ int dt_set_gpu(void *dt)
 
     if (chip_id == T8140)
         return dt_set_gpu_g17(dt, &g17_soc_t8140);
-    if (chip_id == T8142)
-        return dt_set_gpu_g17(dt, &g17_soc_t8142);
+    if (chip_id == T8142) {
+        int sgx = adt_path_offset(adt, "/arm-io/sgx");
+        u32 count;
+        /* Preserve the 25G76 handoff; HAL300 has a different input contract. */
+        if (sgx >= 0 && ADT_GETPROP(adt, sgx, "perf-state-count", &count) == sizeof(count) &&
+            count == g17_soc_t8142.count)
+            return dt_set_gpu_g17(dt, &g17_soc_t8142);
+        return dt_set_gpu_t8142_26(dt);
+    }
 
     if (chip_id == T6040)
         return dt_set_gpu_t6040(dt);

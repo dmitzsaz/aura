@@ -1284,3 +1284,9 @@ int dt_set_gpu_m4(void *dt)
     assert(!"unexpected M4 dispatch in the G15/M3 host fixture");
     return -1;
 }
+
+int dt_set_gpu_t8142_26(void *dt)
+{
+    (void)dt;
+    abort(); /* This host model never dispatches a T8142 GPU. */
+}
