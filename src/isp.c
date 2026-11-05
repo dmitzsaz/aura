@@ -84,6 +84,12 @@ static int isp_firmware_end(const struct adt_segment_ranges *segments, u32 lengt
 
 int isp_init(void)
 {
+    /* Linux starts T8142's resident firmware and backs its main-memory tail. */
+    if (chip_id == T8142) {
+        isp_initialized = false;
+        return 0;
+    }
+
     int err = -1;
     bool t8140 = chip_id == T8140;
     bool powered = false;

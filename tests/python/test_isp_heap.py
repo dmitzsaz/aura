@@ -27,6 +27,7 @@ typedef uint64_t u64;
 #define T6031 0x6031
 #define T6034 0x6034
 #define T8140 0x8140
+#define T8142 0x8142
 #define V12_3 1
 #define V12_4 2
 #define V13_5 3
