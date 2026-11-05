@@ -8461,6 +8461,9 @@ int kboot_prepare_dt(void *fdt)
     // A T6032 takes only its firmware image UUID list (about 16K)
     if (chip_id == T6032)
         dt_bufsize += SZ_16K;
+    // A T8142 takes the tunables of its three USB4/ACIO hosts (about 30K) and its PMP values (20K)
+    if (chip_id == T8142)
+        dt_bufsize += 4 * SZ_16K;
     dt = memalign(DT_ALIGN, dt_bufsize);
 
     if (fdt_open_into(fdt, dt, dt_bufsize) < 0)
