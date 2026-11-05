@@ -216,7 +216,7 @@ OBJECTS := \
 	memory.o memory_asm.o \
 	nvme.o \
 	payload.o \
-	pcie.o pcie_fdt.o pcie_t8142.o kboot_nvme.o \
+	pcie.o pcie_fdt.o pcie_t8142.o kboot_nvme.o kboot_display_t8142.o \
 	pmgr.o \
 	proxy.o \
 	ringbuffer.o \

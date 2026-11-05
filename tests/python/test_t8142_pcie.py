@@ -11,7 +11,8 @@ import pytest
 def producer(tmp_path_factory):
     repo = Path(__file__).resolve().parents[2]
     work = tmp_path_factory.mktemp("t8142-pcie")
-    for name in ("pcie_t8142.c", "pcie.h", "adt.h", "tunables.h", "kboot_nvme.c", "kboot_nvme.h"):
+    for name in ("pcie_t8142.c", "pcie.h", "adt.h", "tunables.h", "kboot_nvme.c", "kboot_nvme.h", "kboot_display_t8142.c",
+                 "kboot_display_t8142.h", "dart.h", "firmware.h"):
         shutil.copy(repo / "src" / name, work)
     for header in (repo / "tests/t8142_pcie_host").glob("*.h"):
         shutil.copy(header, work)
@@ -30,6 +31,6 @@ def producer(tmp_path_factory):
     return binary
 
 
-@pytest.mark.parametrize("scenario", range(20))
+@pytest.mark.parametrize("scenario", range(29))
 def test_producer(producer, scenario):
     subprocess.run([str(producer), str(scenario)], check=True)

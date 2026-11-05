@@ -9,6 +9,7 @@
 #define FIELD_PREP(f, v) (((v) * ((f) & -(f))) & (f))
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 #define min(a, b) ((a) < (b) ? (a) : (b))
+#define SZ_16K 0x4000
 #define T8142 0x8142
 extern u32 chip_id;
 u32 read32(u64 addr);

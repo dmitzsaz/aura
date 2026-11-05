@@ -2,7 +2,15 @@
 #include <assert.h>
 #include <stdlib.h>
 
+#include "kboot_display_t8142.c"
 #include "kboot_nvme.c"
+
+struct fw_version_info os_firmware = {.version = V27_0};
+#define DRAM          0x10000000000UL
+#define DART_SCAN     0xb0000000UL
+#define DART_FW       0xb1000000UL
+#define DART_EXT_SCAN 0xb2000000UL
+#define DART_EXT_FW   0xb3000000UL
 #include "pcie_t8142.c"
 
 /* Synthetic addresses: no board or private ADT data is embedded in this test. */
@@ -104,6 +112,10 @@ int pmgr_adt_power_enable(const char *path)
     powered++;
     return 0;
 }
+int pmgr_adt_is_powered(const char *path)
+{
+    return scenario == 28 ? 0 : 1;
+}
 smc_dev_t *smc_init(void)
 {
     return (void *)1;
@@ -132,6 +144,16 @@ int adt_path_offset(const void *a, const char *path)
         return 4;
     if (!strcmp(path, "/arm-io/gpio0"))
         return 5;
+    if (!strcmp(path, "/chosen"))
+        return 9;
+    if (!strcmp(path, "/arm-io/dart-disp0"))
+        return 10;
+    if (!strcmp(path, "/arm-io/dart-dcp"))
+        return 11;
+    if (!strcmp(path, "/arm-io/dart-dispext1"))
+        return 12;
+    if (!strcmp(path, "/arm-io/dart-dcpext1"))
+        return 13;
     if (!strcmp(path, "/arm-io/ans"))
         return 8;
     return -1;
@@ -163,6 +185,12 @@ int adt_next_sibling_offset(const void *a, int n)
 const void *adt_getprop(const void *a, int node, const char *prop, u32 *len)
 {
     static u32 nports = 3, regs[104];
+    if (!strcmp(prop, "clock-frequencies")) {
+        static u32 rates[] = {0, 0, 0, 0, 0, 0, 402280000};
+        if (len)
+            *len = sizeof(rates);
+        return rates;
+    }
     if (!strcmp(prop, "#ports")) {
         if (len)
             *len = 4;
@@ -177,6 +205,12 @@ const void *adt_getprop(const void *a, int node, const char *prop, u32 *len)
 }
 int adt_getprop_copy(const void *a, int node, const char *prop, void *out, size_t len)
 {
+    if (!strcmp(prop, "dram-base") || !strcmp(prop, "dram-size")) {
+        u64 v = !strcmp(prop, "dram-base") ? DRAM : 0x10000000;
+        assert(len == sizeof(v));
+        memcpy(out, &v, len);
+        return len;
+    }
     u32 value;
     if (!strcmp(prop, "#ports"))
         value = 3;
@@ -217,7 +251,10 @@ int adt_get_reg(const void *a, int *path, const char *prop, int index, u64 *base
 {
     static const u64 shared[] = {ECAM, RC, GLUE, PHY, IP, AXI};
     u64 span = 0x4000;
-    if (path[0] == 5) {
+    if (path[0] >= 10 && path[0] <= 13) {
+        *base = DART_SCAN + (path[0] - 10) * 0x1000000;
+        span = 0x20000;
+    } else if (path[0] == 5) {
         *base = GPIO;
         span = 0x1000;
     } else if (path[0] == 8) {
@@ -257,6 +294,160 @@ u64 dt_get_address(void *dt, int node)
     const fdt64_t *reg = fdt_getprop(dt, node, "reg", NULL);
     return reg ? fdt64_ld(reg) : 0;
 }
+int dart_walk_locked_t8110(uintptr_t base, u64 size, u8 sid, u64 dram, u64 dram_size,
+                           int (*visit)(u64, u64, void *), void *opaque)
+{
+    assert(scenario != 28);
+    assert(dram == DRAM && dram_size == 0x10000000);
+    assert(size == 0x20000);
+    if (scenario == 22 && sid == 16)
+        return -1;
+    if (scenario == 23 && base == DART_EXT_SCAN)
+        return -1;
+    if (visit(0, DRAM + 0x100000, opaque) || visit(SZ_16K, DRAM + 0x104000, opaque))
+        return -1;
+    /* MMIO must reserve its IOVA without being claimed as system RAM. */
+    return visit(0x100000, 0xc0000000, opaque);
+}
+dart_dev_t *dart_init_fdt_locked(void *dt, u32 phandle, int sid)
+{
+    return (void *)1;
+}
+int dart_collect_locked_tables(dart_dev_t *dart, u64 base, u64 size, u64 *pages, size_t capacity,
+                               size_t *count)
+{
+    if (scenario == 26)
+        return -1;
+    assert(base == DRAM && capacity == 2049);
+    *count = 1;
+    pages[0] = DRAM + 0x200000;
+    return 0;
+}
+void dart_shutdown(dart_dev_t *dart)
+{
+}
+
+static void add_alias(void *dt, const char *alias, const char *path)
+{
+    int aliases = fdt_path_offset(dt, "/aliases");
+    assert(!fdt_setprop_string(dt, aliases, alias, path));
+}
+static void display_tree(void *dt, int capacity)
+{
+    assert(!fdt_create_empty_tree(dt, capacity));
+    assert(!fdt_setprop_u32(dt, 0, "#address-cells", 2));
+    assert(!fdt_setprop_u32(dt, 0, "#size-cells", 2));
+    assert(fdt_add_subnode(dt, 0, "aliases") >= 0);
+    int r = fdt_add_subnode(dt, 0, "reserved-memory");
+    assert(r >= 0);
+    assert(!fdt_setprop_u32(dt, r, "#address-cells", 2));
+    assert(!fdt_setprop_u32(dt, r, "#size-cells", 2));
+    assert(!fdt_setprop_empty(dt, r, "ranges"));
+    int ref = fdt_add_subnode(dt, 0, "reference");
+    assert(!fdt_setprop_u32(dt, ref, "phandle", 20));
+    assert(!fdt_setprop_u32(dt, ref, "#clock-cells", 0));
+    assert(!fdt_setprop_u32(dt, ref, "clock-frequency", scenario == 25 ? 0 : 24000000));
+    for (int i = 0; i < 4; i++) {
+        char name[16];
+        snprintf(name, sizeof(name), "dart%d", i);
+        int n = fdt_add_subnode(dt, 0, name);
+        assert(!fdt_setprop_string(dt, n, "compatible", "apple,t8110-dart"));
+        assert(!fdt_setprop_u32(dt, n, "phandle", i + 1));
+        assert(!fdt_setprop_u32(dt, n, "#iommu-cells", 1));
+        fdt64_t reg[] = {cpu_to_fdt64(DART_SCAN + i * 0x1000000), cpu_to_fdt64(0x20000)};
+        assert(!fdt_setprop(dt, n, "reg", reg, sizeof(reg)));
+        fdt64_t range[] = {cpu_to_fdt64(DRAM), cpu_to_fdt64(1UL << 36)};
+        assert(!fdt_setprop(dt, n, "apple,dma-range", range, sizeof(range)));
+        assert(!fdt_setprop_string(dt, n, "status", "disabled"));
+    }
+    const char *owners[] = {"display", "dcp", "piodma", "dcpext1", "ext-piodma"};
+    for (int i = 0; i < 5; i++) {
+        int n = fdt_add_subnode(dt, 0, owners[i]);
+        assert(!fdt_setprop_u32(dt, n, "phandle", 10 + i));
+        assert(!fdt_setprop_string(dt, n, "status", "disabled"));
+        fdt32_t refs[] = {cpu_to_fdt32(i == 0   ? 1
+                                       : i == 1 ? 2
+                                       : i == 2 ? 1
+                                       : i == 3 ? 4
+                                                : 3),
+                          cpu_to_fdt32(i == 1 || i == 3   ? 23
+                                       : i == 2 || i == 4 ? 16
+                                                          : 0),
+                          cpu_to_fdt32(3), 0};
+        if (scenario == 24 && i == 2)
+            refs[1] = cpu_to_fdt32(4);
+        assert(!fdt_setprop(dt, n, "iommus", refs, i == 0 ? 16 : 8));
+        if (i == 1 || i == 3)
+            assert(!fdt_setprop_u32(dt, n, "clocks", 20));
+    }
+    int external = fdt_path_offset(dt, "/dcpext1");
+    int routes = fdt_add_subnode(dt, external, "typec-routes");
+    int route = fdt_add_subnode(dt, routes, "route@0");
+    assert(!fdt_setprop_string(dt, route, "status", "disabled"));
+    add_alias(dt, "dcp", "/dcp");
+    add_alias(dt, "disp0", "/display");
+    add_alias(dt, "disp0_piodma", "/piodma");
+    add_alias(dt, "dcpext1", "/dcpext1");
+    add_alias(dt, "dispext1", "/display");
+    add_alias(dt, "dispext1_piodma", "/ext-piodma");
+}
+static void check_display(void)
+{
+    int capacity = 128 * 1024;
+    void *dt = calloc(1, capacity);
+    display_tree(dt, capacity);
+    int ret = kboot_t8142_display_reserve(dt, "dcp");
+    if (scenario == 22 || scenario == 24 || scenario == 26 || scenario == 28) {
+        assert(ret);
+        assert(!strcmp(fdt_getprop(dt, fdt_path_offset(dt, "dcp"), "status", NULL), "disabled"));
+        free(dt);
+        return;
+    }
+    assert(!ret);
+    if (scenario == 27) {
+        assert(!kboot_t8142_display_reserve(dt, "dcp"));
+        int owner = fdt_path_offset(dt, "dcp"), len;
+        const fdt32_t *regions = fdt_getprop(dt, owner, "memory-region", &len);
+        assert(regions && len > 0);
+        for (int i = 0; i < len / 4; i++)
+            assert(fdt_node_offset_by_phandle(dt, fdt32_ld(regions + i)) >= 0);
+    }
+    ret = kboot_t8142_display_enable(dt, "dcp");
+    if (scenario == 25) {
+        assert(ret);
+        free(dt);
+        return;
+    }
+    assert(!ret);
+    if (scenario == 21 || scenario == 23 || scenario == 27) {
+        ret = kboot_t8142_display_reserve(dt, "dcpext1");
+        if (scenario == 23)
+            assert(ret);
+        else
+            assert(!ret && !kboot_t8142_display_enable(dt, "dcpext1"));
+    }
+    if (scenario == 21 || scenario == 27) {
+        int route = fdt_path_offset(dt, "/dcpext1/typec-routes/route@0");
+        assert(!strcmp(fdt_getprop(dt, route, "status", NULL), "okay"));
+    }
+    assert(!kboot_t8142_display_prune(dt));
+    int master = fdt_path_offset(dt, "disp0"), len;
+    const fdt32_t *iommus = fdt_getprop(dt, master, "iommus", &len);
+    assert(iommus && len == (scenario == 21 || scenario == 27 ? 16 : 8));
+    assert(!strcmp(fdt_getprop(dt, fdt_path_offset(dt, "dcp"), "status", NULL), "okay"));
+    const fdt32_t *rate =
+        fdt_getprop(dt, fdt_path_offset(dt, "/clock-display-video"), "clock-frequency", &len);
+    assert(rate && len == 4 && fdt32_ld(rate) == 402280000);
+    int count = fdt_num_mem_rsv(dt);
+    assert(count >= 6);
+    for (int i = 0; i < count; i++) {
+        uint64_t base, size;
+        assert(!fdt_get_mem_rsv(dt, i, &base, &size));
+        assert(base >= DRAM && size && base + size <= DRAM + 0x10000000);
+    }
+    free(dt);
+}
+
 static void setup(void)
 {
     seed(RC + RC_RUN_ACK, 1); /* Retained ACK must not suppress cold init. */
@@ -272,6 +463,10 @@ int main(int argc, char **argv)
 {
     scenario = atoi(argv[1]);
     setup();
+    if (scenario >= 20) {
+        check_display();
+        return 0;
+    }
     unsigned mask = BIT(0) | BIT(2);
     bool native = true;
     if (scenario == 1 || scenario == 2 || scenario == 5) {
