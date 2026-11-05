@@ -7422,6 +7422,21 @@ static bool dt_node_okay(int node)
     return !status || !strcmp(status, "okay") || !strcmp(status, "ok");
 }
 
+static void dt_set_mtp_firmware(void)
+{
+    if (chip_id != T8142)
+        return;
+
+    int node = fdt_path_offset(dt, "mtp");
+    if (node < 0 || fdt_node_check_compatible(dt, node, "apple,t8142-mtp") || !dt_node_okay(node))
+        return;
+    /* FDT insertion can move the alias string; keep a stable copy. */
+    char path[256];
+    if (fdt_get_path(dt, node, path, sizeof(path)))
+        return;
+    dt_reserve_t8142_asc_dram("/arm-io/mtp", path);
+}
+
 /*
  * The T6040/T6041 AOP runs its __TEXT and __DATA from its own SRAM, but iBoot
  * leaves its external code (__ETEXT) and its log (__OS_LOG) in DRAM. Reserve
@@ -8771,6 +8786,7 @@ int kboot_prepare_dt(void *fdt)
         return -1;
     if (dt_set_aop_firmware())
         return -1;
+    dt_set_mtp_firmware();
     if (dt_set_isp())
         return -1;
     if (dt_set_pmgr())
