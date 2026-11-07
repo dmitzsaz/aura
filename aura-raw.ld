@@ -60,7 +60,11 @@ SECTIONS {
     .data : ALIGN(0x10000) {
         _smp_shared_start = .;
         *(.data.smp_shared)
-        . = ALIGN(0x10000);
+        /*
+         * mmu_remap_smp_shared() maps this area uncached on its own pages; 16 KiB covers both
+         * page sizes and keeps the rest of .data below _file_limit.
+         */
+        . = ALIGN(0x4000);
         _smp_shared_end = .;
         *(EXCLUDE_FILE(*_48.o *_128.o *_256.o *font.o *font_retina.o) .data)
         *(.data.*)
