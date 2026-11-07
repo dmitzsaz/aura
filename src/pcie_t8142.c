@@ -730,20 +730,20 @@ int pcie_t8142_prepare_fdt(void *dt)
 
     bool native = !fdt_node_check_compatible(dt, host, "apple,t8142-pcie");
     u32 ports = 0;
-    if (native) {
-        int child;
-        fdt_for_each_subnode(child, dt, host)
-        {
-            const char *status = fdt_getprop(dt, child, "status", NULL);
-            int len;
-            const fdt32_t *reg = fdt_getprop(dt, child, "reg", &len);
-            if (status && strcmp(status, "okay") && strcmp(status, "ok"))
-                continue;
-            if (!reg || len != 5 * sizeof(*reg) || (fdt32_ld(reg) >> 11) >= APCIE_MAX_PORTS)
-                goto disable;
-            ports |= BIT(fdt32_ld(reg) >> 11);
-        }
-    } else {
+    int child;
+    /* Train the root ports the FDT describes; a generic host may list none. */
+    fdt_for_each_subnode(child, dt, host)
+    {
+        const char *status = fdt_getprop(dt, child, "status", NULL);
+        int len;
+        const fdt32_t *reg = fdt_getprop(dt, child, "reg", &len);
+        if (status && strcmp(status, "okay") && strcmp(status, "ok"))
+            continue;
+        if (!reg || len != 5 * sizeof(*reg) || (fdt32_ld(reg) >> 11) >= APCIE_MAX_PORTS)
+            goto disable;
+        ports |= BIT(fdt32_ld(reg) >> 11);
+    }
+    if (!native && !ports) {
         int node = adt_path_offset(adt, APCIE);
         int bridge = node;
         ADT_FOREACH_CHILD(adt, bridge)
