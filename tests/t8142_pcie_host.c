@@ -501,6 +501,25 @@ int main(int argc, char **argv)
 {
     scenario = atoi(argv[1]);
     setup();
+    if (scenario == 36) {
+        /* A generic ECAM host that lists only port 0 must leave port 2 alone. */
+        char dt[8192];
+        assert(!fdt_create_empty_tree(dt, sizeof(dt)));
+        assert(!fdt_setprop_u32(dt, 0, "#address-cells", 2));
+        assert(!fdt_setprop_u32(dt, 0, "#size-cells", 2));
+        int h = fdt_add_subnode(dt, 0, "pcie");
+        assert(!fdt_setprop_string(dt, h, "compatible", "pci-host-ecam-generic"));
+        assert(!fdt_setprop_string(dt, h, "device_type", "pci"));
+        fdt64_t regs[] = {cpu_to_fdt64(ECAM), cpu_to_fdt64(0x200000)};
+        assert(!fdt_setprop(dt, h, "reg", regs, sizeof(regs)));
+        int child = fdt_add_subnode(dt, h, "pci@0,0");
+        fdt32_t preg[5] = {0};
+        assert(!fdt_setprop(dt, child, "reg", preg, sizeof(preg)));
+        assert(!pcie_t8142_prepare_fdt(dt));
+        assert(!fdt_getprop(dt, h, "status", NULL));
+        assert(smc_writes == 1 && !regfile[slot(BANK(2) + PORT_STATUS)]);
+        return 0;
+    }
     if (scenario >= 20) {
         check_display();
         return 0;
